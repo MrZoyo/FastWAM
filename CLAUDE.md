@@ -19,7 +19,10 @@ bash scripts/train_zero1.sh 4 \
   save_every=5000 \
   eval_every=5000 \
   log_every=10 \
-  wandb.enabled=false
+  wandb.enabled=true \
+  wandb.project=fast-wam \
+  wandb.name=libero_20k_from_init \
+  wandb.mode=online
 ```
 
 To use 8 GPUs, set `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7` and change `scripts/train_zero1.sh 4` to `scripts/train_zero1.sh 8`.
