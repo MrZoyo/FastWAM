@@ -15,6 +15,11 @@ evaluate_results/
 .codex/
 .claude/
 
+# Local caches and backups
+.hf_cache/
+.local/
+data.local_before_origin_main_*/
+
 # Data types
 *.jit
 *.pt

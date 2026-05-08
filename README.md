@@ -13,8 +13,168 @@ Official codebase for **Fast-WAM: Do World Action Models Need Test-time Future I
 
 This repository contains the training and evaluation code for FastWAM on LIBERO / RoboTwin.
 
+## AAO Open Door Closed-Loop Integration
+
+This workspace also contains a local integration of FastWAM with
+`auto-atomic-operation` (AAO) for GS open-door closed-loop validation. The
+integration is intentionally kept separate from the training pipeline:
+
+- AAO is vendored as `third_party/auto-atomic-operation` and pinned to the
+  latest upstream version used for open-door compatibility.
+- Gaussian rendering support is vendored as `third_party/GaussianRenderer`.
+- The FastWAM closed-loop bridge lives in `src/fastwam/closed_loop_eval/`.
+- Single-episode evaluation entrypoint:
+  `scripts/run_aao_closed_loop_eval.py`.
+- Multi-door/background GS sweep entrypoint:
+  `scripts/run_aao_open_door_gs_sweep.py`.
+
+The default open-door task is `open_door_airbot_play_gs`. The current bridge
+uses the mix 20k checkpoint by default:
+
+```text
+runs/mix_uncond_2cam224_1e-4/mix_uncond_20k_20260507_024400/checkpoints/weights/step_020000.pt
+```
+
+Model run directories under `runs/` are intentionally ignored by git. Copy or
+download the corresponding `config.yaml`, `dataset_stats.json`, text embedding
+cache, and checkpoint before using `--model-client fastwam`; use
+`--fastwam-config`, `--dataset-stats`, `--text-cache-dir`, and `--checkpoint`
+to point at a different run.
+
+Control timing is handled by `--sim-loop-frequency`:
+
+- `--sim-loop-frequency 0` means lockstep mode. The runner calls AAO
+  `update(action)` synchronously, then reads the latest observation.
+- `--sim-loop-frequency >0` means continuous mode. AAO runs a background
+  simulation loop at that frequency, while the runner updates the current
+  target action with `set_cartesian_action()` and replans from new observations.
+
+For the mix/open-door data, `/home/zoyo/mix/meta/info.json` reports 20Hz
+actions, while AAO open-door runs at 100Hz. Therefore the default closed-loop
+settings are:
+
+```bash
+.venv/bin/python -B scripts/run_aao_closed_loop_eval.py \
+  --model-client fastwam \
+  --task open_door_airbot_play_gs \
+  --action-horizon 32 \
+  --stride 8 \
+  --action-repeat 5 \
+  --gripper-min 0.02 \
+  --gripper-max 0.0945 \
+  --sim-loop-frequency 0
+```
+
+Important caveat: AAO `final_success` alone is not a reliable open-door
+criterion for the current setup. Always inspect `multicam.mp4` and the
+MuJoCo diagnostics in `client_trace.json.gz` / `aggregate_summary.json`,
+especially `door_hinge` and `handle_hinge` deltas.
+
+The working notes for this integration are:
+
+- `docs/260508-auto-atomic-open-door-plan.md`
+- `docs/260508-auto-atomic-open-door-progress.md`
+
+### AAO Setup
+
+For a fresh checkout, clone submodules first:
+
+```bash
+git clone --recurse-submodules https://github.com/MrZoyo/FastWAM.git
+cd FastWAM
+
+# If the repo was cloned without --recurse-submodules:
+git submodule update --init --recursive
+```
+
+Install the normal FastWAM environment first, then add AAO and the optional
+GS dependencies into the same Python environment. AAO itself is installed from
+the local submodule, while GaussianRenderer is installed from the pinned local
+submodule instead of downloading a floating Git dependency:
+
+```bash
+uv pip install --python .venv/bin/python \
+  -e "third_party/auto-atomic-operation[mujoco]" \
+  -e "third_party/GaussianRenderer[shs,mujoco]" \
+  gsplat==1.5.3 \
+  ninja \
+  natsort \
+  PyOpenGL_accelerate
+```
+
+If you use conda instead of `.venv`, replace `.venv/bin/python` with the
+Python executable from that environment.
+
+The AAO MuJoCo meshes are managed by Git LFS inside the AAO submodule. Pull
+them once after cloning submodules:
+
+```bash
+git -C third_party/auto-atomic-operation lfs pull \
+  --include "assets/meshes/**" \
+  --exclude "assets/videos/**"
+```
+
+The 3DGS assets are not committed to this repository. Download the open-door
+GS assets from the Hugging Face dataset before running GS open-door evaluation:
+
+```bash
+uv pip install --python .venv/bin/python huggingface_hub
+
+huggingface-cli download OpenGHz/auto-atom-assets \
+  --repo-type dataset \
+  --local-dir third_party/auto-atomic-operation \
+  --include "assets/gs/robots/airbot_play/*" \
+  --include "assets/gs/robots/airbot_g2p/*" \
+  --include "assets/gs/scenes/open_door/door1.ply" \
+  --include "assets/gs/scenes/open_door/door2.ply" \
+  --include "assets/gs/scenes/open_door/door3.ply" \
+  --include "assets/gs/scenes/open_door/door4.ply" \
+  --include "assets/gs/scenes/open_door/door11.ply" \
+  --include "assets/gs/scenes/open_door/door14.ply" \
+  --include "assets/gs/scenes/open_door/door15.ply" \
+  --include "assets/gs/scenes/open_door/door17.ply" \
+  --include "assets/gs/scenes/open_door/door19.ply" \
+  --include "assets/gs/scenes/open_door/real_knob1.ply" \
+  --include "assets/gs/scenes/open_door/real_lock1.ply" \
+  --include "assets/gs/backgrounds/door_bg/**"
+```
+
+For a minimal simulator sanity check:
+
+```bash
+.venv/bin/python -B scripts/run_aao_closed_loop_eval.py \
+  --model-client hold \
+  --episodes 1 \
+  --max-updates 1 \
+  --stride 1 \
+  --action-repeat 1 \
+  --sim-loop-frequency 0 \
+  --no-video \
+  --output-dir runs/aao_closed_loop/smoke_hold_open_door_gs
+```
+
+The 30-environment GS sweep uses the door list
+`door1,door2,door3,door4,door11,door14,door15,door17,door19`, random wall
+backgrounds, and the shared `real_knob1.ply` / `real_lock1.ply` handle assets:
+
+```bash
+.venv/bin/python -B scripts/run_aao_open_door_gs_sweep.py \
+  --gpu 0 \
+  --device cuda:0 \
+  --output-dir runs/aao_closed_loop/fastwam_mix20k_open_door_gs_30env_repeat5_lockstep \
+  --num-combos 30 \
+  --strides 4,8 \
+  --max-updates 160 \
+  --action-repeat 5 \
+  --action-horizon 32 \
+  --num-inference-steps 10 \
+  --sim-loop-frequency 0
+```
+
 ## Index
 
+- [AAO Open Door Closed-Loop Integration](#aao-open-door-closed-loop-integration)
+  - [AAO Setup](#aao-setup)
 - [File Structure](#file-structure)
 - [Environment Setup](#environment-setup)
 - [Model Preparation](#model-preparation)

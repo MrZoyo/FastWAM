@@ -1,0 +1,8 @@
+[submodule "third_party/auto-atomic-operation"]
+	path = third_party/auto-atomic-operation
+	url = https://github.com/DISCOVER-Robotics/auto-atomic-operation.git
+	branch = main
+[submodule "third_party/GaussianRenderer"]
+	path = third_party/GaussianRenderer
+	url = https://github.com/OpenGHz/GaussianRenderer.git
+	branch = main

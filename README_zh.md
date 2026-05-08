@@ -13,8 +13,161 @@
 
 本仓库包含 FastWAM 在 LIBERO / RoboTwin 上的训练与评估代码。
 
+## AAO Open Door 闭环仿真集成
+
+当前工作区额外集成了 `auto-atomic-operation`（AAO），用于 GS 版本
+open door 任务的闭环仿真验证。这部分和训练主流程解耦：
+
+- AAO 以 submodule 形式放在 `third_party/auto-atomic-operation`。
+- Gaussian renderer 以 submodule 形式放在 `third_party/GaussianRenderer`。
+- FastWAM 到 AAO 的闭环桥接代码在 `src/fastwam/closed_loop_eval/`。
+- 单 episode 入口：`scripts/run_aao_closed_loop_eval.py`。
+- 多门/多背景 sweep 入口：`scripts/run_aao_open_door_gs_sweep.py`。
+
+默认任务是 `open_door_airbot_play_gs`。当前闭环代码默认使用 mix 20k
+权重：
+
+```text
+runs/mix_uncond_2cam224_1e-4/mix_uncond_20k_20260507_024400/checkpoints/weights/step_020000.pt
+```
+
+`runs/` 下的模型运行目录不会提交进 git。使用 `--model-client fastwam`
+前，需要先复制或下载对应的 `config.yaml`、`dataset_stats.json`、text
+embedding cache 和 checkpoint；如果使用别的 run，用 `--fastwam-config`、
+`--dataset-stats`、`--text-cache-dir`、`--checkpoint` 显式指定。
+
+控制方式只由 `--sim-loop-frequency` 决定：
+
+- `--sim-loop-frequency 0`：lockstep，同步调用 AAO `update(action)`，
+  再读取最新 observation。
+- `--sim-loop-frequency >0`：continuous，AAO 后台按该频率持续仿真，
+  runner 只用 `set_cartesian_action()` 更新当前目标动作，并从新
+  observation 重新规划。
+
+对于当前 mix/open-door 数据，`/home/zoyo/mix/meta/info.json` 显示 action
+频率是 20Hz，AAO open door 的 `env.update_freq` 是 100Hz。因此默认闭环
+参数为：
+
+```bash
+.venv/bin/python -B scripts/run_aao_closed_loop_eval.py \
+  --model-client fastwam \
+  --task open_door_airbot_play_gs \
+  --action-horizon 32 \
+  --stride 8 \
+  --action-repeat 5 \
+  --gripper-min 0.02 \
+  --gripper-max 0.0945 \
+  --sim-loop-frequency 0
+```
+
+注意：当前 AAO `final_success` 不能单独作为真实开门成功标准。需要同时
+检查 `multicam.mp4` 和 `client_trace.json.gz` / `aggregate_summary.json`
+里的 MuJoCo 诊断，尤其是 `door_hinge` 和 `handle_hinge` 的位移。
+
+本次集成的工作记录在：
+
+- `docs/260508-auto-atomic-open-door-plan.md`
+- `docs/260508-auto-atomic-open-door-progress.md`
+
+### AAO 部署
+
+全新 clone 时需要拉取 submodule：
+
+```bash
+git clone --recurse-submodules https://github.com/MrZoyo/FastWAM.git
+cd FastWAM
+
+# 如果 clone 时没有加 --recurse-submodules，则补执行：
+git submodule update --init --recursive
+```
+
+先安装 FastWAM 常规环境，然后在同一个 Python 环境中补 AAO/GS 可选依赖。
+AAO 从本地 submodule 安装，GaussianRenderer 也使用已经 pin 住的本地
+submodule，避免重新拉一个浮动的 Git 依赖：
+
+```bash
+uv pip install --python .venv/bin/python \
+  -e "third_party/auto-atomic-operation[mujoco]" \
+  -e "third_party/GaussianRenderer[shs,mujoco]" \
+  gsplat==1.5.3 \
+  ninja \
+  natsort \
+  PyOpenGL_accelerate
+```
+
+如果你使用 conda 环境，把 `.venv/bin/python` 换成对应 conda 环境里的
+Python 路径即可。
+
+AAO MuJoCo mesh 由 AAO submodule 内的 Git LFS 管理。clone submodule 后
+需要拉一次 LFS mesh：
+
+```bash
+git -C third_party/auto-atomic-operation lfs pull \
+  --include "assets/meshes/**" \
+  --exclude "assets/videos/**"
+```
+
+3DGS 资产不会提交进本仓库，运行 GS open door 前需要从 Hugging Face
+dataset 下载 open-door 需要的 GS assets：
+
+```bash
+uv pip install --python .venv/bin/python huggingface_hub
+
+huggingface-cli download OpenGHz/auto-atom-assets \
+  --repo-type dataset \
+  --local-dir third_party/auto-atomic-operation \
+  --include "assets/gs/robots/airbot_play/*" \
+  --include "assets/gs/robots/airbot_g2p/*" \
+  --include "assets/gs/scenes/open_door/door1.ply" \
+  --include "assets/gs/scenes/open_door/door2.ply" \
+  --include "assets/gs/scenes/open_door/door3.ply" \
+  --include "assets/gs/scenes/open_door/door4.ply" \
+  --include "assets/gs/scenes/open_door/door11.ply" \
+  --include "assets/gs/scenes/open_door/door14.ply" \
+  --include "assets/gs/scenes/open_door/door15.ply" \
+  --include "assets/gs/scenes/open_door/door17.ply" \
+  --include "assets/gs/scenes/open_door/door19.ply" \
+  --include "assets/gs/scenes/open_door/real_knob1.ply" \
+  --include "assets/gs/scenes/open_door/real_lock1.ply" \
+  --include "assets/gs/backgrounds/door_bg/**"
+```
+
+最小仿真 sanity check：
+
+```bash
+.venv/bin/python -B scripts/run_aao_closed_loop_eval.py \
+  --model-client hold \
+  --episodes 1 \
+  --max-updates 1 \
+  --stride 1 \
+  --action-repeat 1 \
+  --sim-loop-frequency 0 \
+  --no-video \
+  --output-dir runs/aao_closed_loop/smoke_hold_open_door_gs
+```
+
+30 环境 GS sweep 默认使用门列表
+`door1,door2,door3,door4,door11,door14,door15,door17,door19`，随机 wall
+背景，并统一使用 `real_knob1.ply` / `real_lock1.ply`：
+
+```bash
+.venv/bin/python -B scripts/run_aao_open_door_gs_sweep.py \
+  --gpu 0 \
+  --device cuda:0 \
+  --output-dir runs/aao_closed_loop/fastwam_mix20k_open_door_gs_30env_repeat5_lockstep \
+  --num-combos 30 \
+  --strides 4,8 \
+  --max-updates 160 \
+  --action-repeat 5 \
+  --action-horizon 32 \
+  --num-inference-steps 10 \
+  --sim-loop-frequency 0
+```
+
 ## 目录
 
+- [AAO Open Door 闭环仿真集成](#aao-open-door-闭环仿真集成)
+  - [AAO 部署](#aao-部署)
 - [File Structure](#file-structure)
 - [环境安装](#环境安装)
 - [模型准备](#模型准备)
