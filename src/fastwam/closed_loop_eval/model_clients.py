@@ -3,18 +3,75 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+logger = logging.getLogger(__name__)
+
+
+def _looks_composed_fastwam_config(cfg: DictConfig) -> bool:
+    if "data" not in cfg or "model" not in cfg:
+        return False
+    model_cfg = cfg.get("model")
+    return model_cfg is not None and model_cfg.get("_target_") is not None
+
+
+def load_fastwam_config(config_path: str | Path) -> DictConfig:
+    """Load either a composed FastWAM config or a configs/task/*.yaml file."""
+    path = Path(config_path).expanduser().resolve()
+    cfg = OmegaConf.load(path)
+    if _looks_composed_fastwam_config(cfg):
+        OmegaConf.resolve(cfg)
+        return cfg
+
+    configs_dir = path.parents[1] if path.parent.name == "task" else _REPO_ROOT / "configs"
+    task_name = path.stem
+    with initialize_config_dir(config_dir=str(configs_dir), version_base=None):
+        cfg = compose(config_name="train", overrides=[f"task={task_name}"])
+    OmegaConf.resolve(cfg)
+    return cfg
+
+
+def _select_inference_data_cfg(cfg: DictConfig) -> DictConfig:
+    data_cfg = cfg.data.get("val")
+    if data_cfg is None:
+        data_cfg = cfg.data.train
+    return data_cfg
+
+
+def _prepare_model_cfg_for_checkpoint_inference(cfg: DictConfig) -> None:
+    model_cfg = cfg.get("model")
+    if model_cfg is None:
+        return
+    path_value = model_cfg.get("action_dit_pretrained_path")
+    if path_value is None or bool(model_cfg.get("skip_dit_load_from_pretrain", False)):
+        return
+    path = Path(str(path_value)).expanduser()
+    if not path.is_absolute():
+        path = _REPO_ROOT / path
+    if path.exists():
+        return
+    logger.warning(
+        "ActionDiT pretrained path is missing (%s); skipping pretrained ActionDiT load "
+        "and expecting the provided FastWAM checkpoint to populate weights.",
+        path,
+    )
+    model_cfg.skip_dit_load_from_pretrain = True
+    model_cfg.action_dit_pretrained_path = None
 
 
 class BaseModelClient(ABC):
@@ -58,6 +115,8 @@ class FastWAMModelClient(BaseModelClient):
         seed: int | None = 42,
         rand_device: str = "cpu",
         action_mode: str = "delta6_abs_gripper",
+        preload_text_context: bool = True,
+        output_action_format: str = "cartesian_absolute",
     ) -> None:
         self.config_path = Path(config_path).expanduser().resolve()
         self.checkpoint_path = Path(checkpoint_path).expanduser().resolve()
@@ -70,19 +129,23 @@ class FastWAMModelClient(BaseModelClient):
         self.seed = None if seed is None else int(seed)
         self.rand_device = str(rand_device)
         self.action_mode = str(action_mode)
+        self.preload_text_context = bool(preload_text_context)
+        self.output_action_format = str(output_action_format)
         self.call_index = 0
 
         if self.action_mode != "delta6_abs_gripper":
             raise ValueError("Only action_mode='delta6_abs_gripper' is currently supported.")
 
-        self.cfg = OmegaConf.load(self.config_path)
-        self.processor = instantiate(self.cfg.data.val.processor)
+        self.cfg = load_fastwam_config(self.config_path)
+        _prepare_model_cfg_for_checkpoint_inference(self.cfg)
+        self.data_cfg = _select_inference_data_cfg(self.cfg)
+        self.processor = instantiate(self.data_cfg.processor)
         stats = load_dataset_stats_from_json(str(self.dataset_stats_path))
         self.processor.set_normalizer_from_stats(stats)
         self.processor.eval()
 
         if self.text_cache_dir is None:
-            self.text_cache_dir = Path(str(self.cfg.data.val.text_embedding_cache_dir))
+            self.text_cache_dir = Path(str(self.data_cfg.text_embedding_cache_dir))
         self.text_cache_dir = self.text_cache_dir.expanduser()
 
         mixed_precision = str(self.cfg.get("mixed_precision", "bf16"))
@@ -93,19 +156,28 @@ class FastWAMModelClient(BaseModelClient):
         self.model = instantiate(self.cfg.model, model_dtype=model_dtype, device=self.device)
         self.model.load_checkpoint(str(self.checkpoint_path))
         self.model.eval()
-        self.context, self.context_mask, self.full_prompt = self._load_text_context(self.instruction)
+        self._text_context_cache: dict[str, tuple[torch.Tensor, torch.Tensor, str]] = {}
+        self.full_prompt = DEFAULT_PROMPT.format(task=self.instruction)
+        if self.preload_text_context:
+            self.context, self.context_mask, self.full_prompt = self._get_text_context(self.instruction)
+        else:
+            self.context = None
+            self.context_mask = None
 
-        train_cfg = self.cfg.data.val
-        self.video_size = tuple(int(x) for x in train_cfg.video_size)
-        self.concat_multi_camera = str(train_cfg.get("concat_multi_camera", "horizontal"))
+        self.video_size = tuple(int(x) for x in self.data_cfg.video_size)
+        self.concat_multi_camera = str(self.data_cfg.get("concat_multi_camera", "horizontal"))
         self.image_shapes = {
             str(meta["key"]): tuple(int(v) for v in meta["shape"])
-            for meta in train_cfg.shape_meta.images
+            for meta in self.data_cfg.shape_meta.images
         }
+        self.state_key = str(self.data_cfg.shape_meta.state[0]["key"])
+        self.proprio_dim = int(self.data_cfg.shape_meta.state[0]["raw_shape"])
 
     def infer(self, model_input: dict[str, Any]) -> dict[str, Any]:
         input_image = self._preprocess_images(model_input["images"])
         proprio_norm = self._normalize_proprio(model_input["proprio_raw"])
+        instruction = str(model_input.get("instruction", self.instruction))
+        context, context_mask, full_prompt = self._get_text_context(instruction)
         seed = None if self.seed is None else self.seed + self.call_index
         self.call_index += 1
 
@@ -115,26 +187,39 @@ class FastWAMModelClient(BaseModelClient):
                 input_image=input_image,
                 action_horizon=self.action_horizon,
                 proprio=proprio_norm,
-                context=self.context,
-                context_mask=self.context_mask,
+                context=context,
+                context_mask=context_mask,
                 num_inference_steps=self.num_inference_steps,
                 seed=seed,
                 rand_device=self.rand_device,
             )
         action_norm = output["action"].detach().to(device="cpu", dtype=torch.float32)
         denorm_delta = self._denormalize_action(action_norm, proprio_norm)
+        current_position = self._resolve_current_position(model_input)
         absolute = self._delta_to_absolute(
             denorm_delta,
-            np.asarray(model_input["cartesian_position"], dtype=np.float32),
+            current_position,
         )
         return {
-            "action_format": "cartesian_absolute",
+            "action_format": self.output_action_format,
             "actions": absolute.astype(np.float32, copy=False),
             "source": "fastwam",
             "action_mode": self.action_mode,
             "normalized_action_shape": list(action_norm.shape),
-            "full_prompt": self.full_prompt,
+            "full_prompt": full_prompt,
+            "instruction": instruction,
         }
+
+    def _resolve_current_position(self, model_input: dict[str, Any]) -> np.ndarray:
+        for key in ("current_position", "joint_position", "cartesian_position"):
+            if key in model_input and model_input[key] is not None:
+                current = np.asarray(model_input[key], dtype=np.float32).reshape(-1)
+                break
+        else:
+            current = np.asarray(model_input["proprio_raw"], dtype=np.float32).reshape(-1)[:6]
+        if current.size < 6:
+            raise RuntimeError(f"Current position must contain at least 6 values, got {current.size}.")
+        return current
 
     def _preprocess_images(self, images: dict[str, np.ndarray]) -> torch.Tensor:
         camera_tensors: list[torch.Tensor] = []
@@ -168,7 +253,9 @@ class FastWAMModelClient(BaseModelClient):
 
     def _normalize_proprio(self, proprio_raw: np.ndarray) -> torch.Tensor:
         proprio = torch.as_tensor(proprio_raw, dtype=torch.float32).reshape(1, -1)
-        batch = {"state": {"default": proprio.clone()}}
+        if proprio.shape[-1] != self.proprio_dim:
+            raise RuntimeError(f"Expected proprio_raw length {self.proprio_dim}, got {proprio.shape[-1]}.")
+        batch = {"state": {self.state_key: proprio.clone()}}
         batch = self.processor.normalizer.forward(batch)
         batch = self.processor.action_state_merger.forward(batch)
         return batch["state"].to(device=self.model.device, dtype=self.model.torch_dtype)
@@ -206,10 +293,18 @@ class FastWAMModelClient(BaseModelClient):
         action[:, :6] = action[:, :6] + current[:6][None, :]
         return action
 
+    def _get_text_context(self, instruction: str) -> tuple[torch.Tensor, torch.Tensor, str]:
+        cached = self._text_context_cache.get(instruction)
+        if cached is not None:
+            return cached
+        context = self._load_text_context(instruction)
+        self._text_context_cache[instruction] = context
+        return context
+
     def _load_text_context(self, instruction: str) -> tuple[torch.Tensor, torch.Tensor, str]:
         full_prompt = DEFAULT_PROMPT.format(task=instruction)
         hashed = hashlib.sha256(full_prompt.encode("utf-8")).hexdigest()
-        cache_path = self.text_cache_dir / f"{hashed}.t5_len{int(self.cfg.data.val.context_len)}.wan22ti2v5b.pt"
+        cache_path = self.text_cache_dir / f"{hashed}.t5_len{int(self.data_cfg.context_len)}.wan22ti2v5b.pt"
         if not cache_path.exists():
             raise FileNotFoundError(
                 f"Missing text embedding cache: {cache_path}. "
