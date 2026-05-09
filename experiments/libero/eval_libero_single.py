@@ -1,3 +1,4 @@
+import hashlib
 import json
 import inspect
 import logging
@@ -291,6 +292,50 @@ def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
         )
 
 
+
+def _resolve_text_embedding_cache_dir(cfg: DictConfig) -> Optional[Path]:
+    explicit = cfg.EVALUATION.get("text_embedding_cache_dir")
+    if explicit is None:
+        return None
+    return Path(os.path.expanduser(os.path.expandvars(str(explicit))))
+
+
+def _load_cached_text_context(
+    prompt: str,
+    cfg: DictConfig,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    cache_dir = _resolve_text_embedding_cache_dir(cfg)
+    if cache_dir is None:
+        return None, None
+
+    context_len = int(cfg.EVALUATION.get("context_len", cfg.data.train.get("context_len", 128)))
+    hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    cache_path = cache_dir / f"{hashed}.t5_len{context_len}.wan22ti2v5b.pt"
+    if not cache_path.exists():
+        raise FileNotFoundError(
+            f"Missing text embedding cache for eval prompt: {cache_path}. "
+            "Set EVALUATION.text_embedding_cache_dir=null to use the text encoder instead."
+        )
+
+    payload = torch.load(cache_path, map_location="cpu")
+    context = payload["context"]
+    context_mask = payload["mask"].bool()
+    if context.ndim != 2 or context_mask.ndim != 1:
+        raise ValueError(
+            f"Cached eval context must be [L,D]/[L], got "
+            f"{tuple(context.shape)} and {tuple(context_mask.shape)} in {cache_path}"
+        )
+    if context.shape[0] != context_len or context_mask.shape[0] != context_len:
+        raise ValueError(
+            f"Cached eval context_len mismatch: expected {context_len}, got "
+            f"{context.shape[0]} and {context_mask.shape[0]} in {cache_path}"
+        )
+
+    context = context.clone()
+    context[~context_mask] = 0.0
+    context_mask = torch.ones_like(context_mask, dtype=torch.bool)
+    return context, context_mask
+
 def _select_predicted_future_frames(pred_video: list[Image.Image], cfg: DictConfig) -> list[Image.Image]:
     if len(pred_video) == 0:
         raise ValueError("`infer_joint` returned an empty predicted video.")
@@ -375,6 +420,7 @@ def _predict_action_chunk(
         num_inference_steps = int(num_inference_steps_cfg)
     prompt_template = DEFAULT_PROMPT
     prompt = prompt_template.format(task=task_description)
+    context, context_mask = _load_cached_text_context(prompt, cfg)
 
     image, proprio, imgs = _obs_to_model_input(
         obs,
@@ -387,7 +433,7 @@ def _predict_action_chunk(
     )
 
     infer_kwargs = {
-        "prompt": prompt,
+        "prompt": prompt if context is None else None,
         "input_image": image,
         "action_horizon": action_horizon,
         "negative_prompt": str(cfg.EVALUATION.get("negative_prompt", "")),
@@ -403,6 +449,9 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
+    if context is not None:
+        infer_kwargs["context"] = context
+        infer_kwargs["context_mask"] = context_mask
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     predicted_future_frames = None
     if visualize_future_video:
