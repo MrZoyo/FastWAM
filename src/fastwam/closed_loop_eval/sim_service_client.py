@@ -30,9 +30,14 @@ def _load_aao_modules(aao_root: Path):
     if root_str not in sys.path:
         sys.path.insert(0, root_str)
     policy_eval = importlib.import_module("auto_atom.policy_eval")
-    runtime = importlib.import_module("auto_atom.runtime")
+    try:
+        config_loader = importlib.import_module("auto_atom.config_loader")
+        load_task_file_hydra = config_loader.load_task_file_hydra
+    except (ImportError, AttributeError):
+        runtime = importlib.import_module("auto_atom.runtime")
+        load_task_file_hydra = runtime.load_task_file_hydra
     pose = importlib.import_module("auto_atom.utils.pose")
-    return policy_eval.PolicyEvaluator, runtime.load_task_file_hydra, pose.euler_to_quaternion
+    return policy_eval.PolicyEvaluator, load_task_file_hydra, pose.euler_to_quaternion
 
 
 def _default_action_applier(context: Any, action: Any, env_mask: np.ndarray | None = None) -> None:

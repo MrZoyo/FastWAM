@@ -20,13 +20,16 @@ This workspace also contains a local integration of FastWAM with
 integration is intentionally kept separate from the training pipeline:
 
 - AAO is vendored as `third_party/auto-atomic-operation` and pinned to the
-  latest upstream version used for open-door compatibility.
+  latest DISCOVER fork commit used for open-door compatibility. The current
+  pin is `8a9d5c7`, which includes OpenGHz upstream `5303f50`.
 - Gaussian rendering support is vendored as `third_party/GaussianRenderer`.
 - The FastWAM closed-loop bridge lives in `src/fastwam/closed_loop_eval/`.
 - Single-episode evaluation entrypoint:
   `scripts/run_aao_closed_loop_eval.py`.
 - Multi-door/background GS sweep entrypoint:
   `scripts/run_aao_open_door_gs_sweep.py`.
+- Pred/VAE-recon/actual simulator comparison video entrypoint:
+  `scripts/run_aao_visual_rollout.py`.
 
 The default open-door task is `open_door_airbot_play_gs`. The current bridge
 uses the mix 20k checkpoint by default:
@@ -69,6 +72,22 @@ Important caveat: AAO `final_success` alone is not a reliable open-door
 criterion for the current setup. Always inspect `multicam.mp4` and the
 MuJoCo diagnostics in `client_trace.json.gz` / `aggregate_summary.json`,
 especially `door_hinge` and `handle_hinge` deltas.
+
+For visual debugging of the model's imagined future against VAE reconstruction
+and actual AAO observations, use the visual rollout script. `--frame-sampling
+sim-update` writes one output frame per AAO update; for two 32-action windows
+with `--action-repeat 5`, this produces 320 frames:
+
+```bash
+.venv/bin/python -B scripts/run_aao_visual_rollout.py \
+  --task open_door_airbot_play_gs \
+  --num-windows 2 \
+  --action-horizon 32 \
+  --action-repeat 5 \
+  --num-video-frames 9 \
+  --frame-sampling sim-update \
+  --output-dir runs/aao_closed_loop/mix20k_open_door_gs_2win_visual_simupdate
+```
 
 The working notes for this integration are:
 

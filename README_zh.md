@@ -18,11 +18,14 @@
 当前工作区额外集成了 `auto-atomic-operation`（AAO），用于 GS 版本
 open door 任务的闭环仿真验证。这部分和训练主流程解耦：
 
-- AAO 以 submodule 形式放在 `third_party/auto-atomic-operation`。
+- AAO 以 submodule 形式放在 `third_party/auto-atomic-operation`，当前 pin
+  到 DISCOVER fork 的 `8a9d5c7`，该版本包含 OpenGHz 上游 `5303f50`。
 - Gaussian renderer 以 submodule 形式放在 `third_party/GaussianRenderer`。
 - FastWAM 到 AAO 的闭环桥接代码在 `src/fastwam/closed_loop_eval/`。
 - 单 episode 入口：`scripts/run_aao_closed_loop_eval.py`。
 - 多门/多背景 sweep 入口：`scripts/run_aao_open_door_gs_sweep.py`。
+- pred / VAE recon / 实际仿真对比视频入口：
+  `scripts/run_aao_visual_rollout.py`。
 
 默认任务是 `open_door_airbot_play_gs`。当前闭环代码默认使用 mix 20k
 权重：
@@ -63,6 +66,21 @@ embedding cache 和 checkpoint；如果使用别的 run，用 `--fastwam-config`
 注意：当前 AAO `final_success` 不能单独作为真实开门成功标准。需要同时
 检查 `multicam.mp4` 和 `client_trace.json.gz` / `aggregate_summary.json`
 里的 MuJoCo 诊断，尤其是 `door_hinge` 和 `handle_hinge` 的位移。
+
+需要对比模型想象视频、VAE recon 和 AAO 实际观测时，可以使用 visual
+rollout 脚本。`--frame-sampling sim-update` 会按每个 AAO update 输出一帧；
+例如 2 个 32-action window、`--action-repeat 5` 会生成 320 帧：
+
+```bash
+.venv/bin/python -B scripts/run_aao_visual_rollout.py \
+  --task open_door_airbot_play_gs \
+  --num-windows 2 \
+  --action-horizon 32 \
+  --action-repeat 5 \
+  --num-video-frames 9 \
+  --frame-sampling sim-update \
+  --output-dir runs/aao_closed_loop/mix20k_open_door_gs_2win_visual_simupdate
+```
 
 本次集成的工作记录在：
 

@@ -221,6 +221,65 @@ class FastWAMModelClient(BaseModelClient):
             raise RuntimeError(f"Current position must contain at least 6 values, got {current.size}.")
         return current
 
+    def infer_joint_video(
+        self,
+        model_input: dict[str, Any],
+        *,
+        num_video_frames: int,
+        test_action_with_infer_action: bool = False,
+    ) -> dict[str, Any]:
+        """Infer a 32-action chunk plus a future video clip for visualization."""
+        input_image = self._preprocess_images(model_input["images"])
+        proprio_norm = self._normalize_proprio(model_input["proprio_raw"])
+        instruction = str(model_input.get("instruction", self.instruction))
+        context, context_mask, full_prompt = self._get_text_context(instruction)
+        seed = None if self.seed is None else self.seed + self.call_index
+        self.call_index += 1
+
+        with torch.no_grad():
+            output = self.model.infer_joint(
+                prompt=None,
+                input_image=input_image,
+                num_video_frames=int(num_video_frames),
+                action_horizon=self.action_horizon,
+                proprio=proprio_norm,
+                context=context,
+                context_mask=context_mask,
+                num_inference_steps=self.num_inference_steps,
+                seed=seed,
+                rand_device=self.rand_device,
+                test_action_with_infer_action=test_action_with_infer_action,
+        )
+        action_norm = output["action"].detach().to(device="cpu", dtype=torch.float32)
+        denorm_delta = self._denormalize_action(action_norm, proprio_norm)
+        current_position = self._resolve_current_position(model_input)
+        absolute = self._delta_to_absolute(
+            denorm_delta,
+            current_position,
+        )
+        return {
+            "action_format": self.output_action_format,
+            "actions": absolute.astype(np.float32, copy=False),
+            "video": list(output["video"]),
+            "source": "fastwam_joint_video",
+            "action_mode": self.action_mode,
+            "num_video_frames": int(num_video_frames),
+            "normalized_action_shape": list(action_norm.shape),
+            "full_prompt": full_prompt,
+            "instruction": instruction,
+        }
+
+    def reconstruct_video_from_model_inputs(self, model_inputs: list[dict[str, Any]]) -> list[Image.Image]:
+        """VAE-reconstruct model-facing actual frames for pred/recon/actual comparison."""
+        if not model_inputs:
+            return []
+        frame_tensors = [self._preprocess_images(item["images"])[0] for item in model_inputs]
+        video = torch.stack(frame_tensors, dim=1).unsqueeze(0)
+        video = video.to(device=self.model.device, dtype=self.model.torch_dtype)
+        with torch.no_grad():
+            latents = self.model._encode_video_latents(video, tiled=False)
+            return list(self.model._decode_latents(latents, tiled=False))
+
     def _preprocess_images(self, images: dict[str, np.ndarray]) -> torch.Tensor:
         camera_tensors: list[torch.Tensor] = []
         for camera_key in self.image_shapes:

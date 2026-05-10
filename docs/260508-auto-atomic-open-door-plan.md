@@ -8,11 +8,11 @@
 
 - `WorldModel_3d` 已同步到 `a08e872`，闭环入口在 `closed_loop_eval/run_closed_loop_eval.py`。
 - `WorldModel_3d` 使用 `auto-atomic-operation` 作为仓库内 submodule，而不是外部软链接。
-- `WorldModel_3d/auto-atomic-operation` 当前 pin 在 `2f7a10b`，但子模块上游 `origin/main` 已到 `f12f75c`。
-- `2f7a10b..origin/main` 中包含大量 open door 相关修复和新增配置，包括 `open_door_airbot_play_gs.yaml`、`open_door_airbot_play_g2p.yaml`、`open_door_airbot_play_back_gs.yaml`、door 物理、GS、相机和 Airbot 配置更新。
-- FastWAM 已新增自己的 AAO submodule：`third_party/auto-atomic-operation`，跟踪 `main`，当前 pin 到远端最新 `f12f75c2220ad7a7ffce54d349a323c4a431d869`。
+- `WorldModel_3d/auto-atomic-operation` 最初参考 pin 为 `2f7a10b`；FastWAM 侧需要使用更新的 AAO open door/Airbot/GS 配置。
+- `2f7a10b` 之后包含大量 open door 相关修复和新增配置，包括 `open_door_airbot_play_gs.yaml`、`open_door_airbot_play_g2p.yaml`、`open_door_airbot_play_back_gs.yaml`、door 物理、GS、相机和 Airbot 配置更新。
+- FastWAM 已新增自己的 AAO submodule：`third_party/auto-atomic-operation`，跟踪 `main`，当前 pin 到 DISCOVER 远端 commit `8a9d5c76136ba7e02e14d25646d9b614ab984081`，该 commit 包含 OpenGHz 上游 `5303f50e0366a0c14560da133b8c85871bf0b95d`。
 - FastWAM 已新增 `third_party/GaussianRenderer` submodule，跟踪 `main`，当前 pin 到 `8eb95dd690626bdece989b6f1b2cad10371ce652`，用于 AAO GS open door。
-- FastWAM 目前没有 AAO 集成层，也没有 WorldModel 风格的 WebSocket inference server。
+- FastWAM 已新增进程内 AAO 集成层，不依赖 WorldModel 风格的 WebSocket inference server。
 - FastWAM 的模型动作输出在模型归一化空间内，需要使用训练时 `FastWAMProcessor` 的 normalizer 做反归一化后再送给仿真器。
 - 可用于第一轮测试的既有 mix 20k 权重：
   - checkpoint: `/DATA/disk1/zoyo/FastWAM/runs/mix_uncond_2cam224_1e-4/mix_uncond_20k_20260507_024400/checkpoints/weights/step_020000.pt`
@@ -63,8 +63,8 @@ WorldModel 的闭环结构可以直接借鉴：
 
 - 输入：FastWAM `infer_action` 需要单张拼接后的首帧图像 `[1, 3, H, W]`、prompt 或 cached text context、可选 proprio。
 - 图像：real_1048 训练配置是双相机水平拼接，最终 `video_size=[224,448]`；AAO 应映射两路相机到 FastWAM 训练相机：
-  - 初始候选：`env1_cam -> head_left`
-  - 初始候选：`wrist_cam -> right_wrist_left`
+  - 当前默认：`env2_cam -> head_left`
+  - 当前默认：`eef_wrist_cam -> right_wrist_left`
 - 状态：real_1048/mix 训练 state/action 是 7 维。AAO observation 提供的是 EEF pose 和 gripper；当前按以下语义适配：
   - 训练动作名：`delta_x, delta_y, delta_z, delta_roll, delta_pitch, delta_yaw, right_gripper_position`
   - AAO apply 期望：`cartesian_absolute`，即绝对 `[x, y, z, r, p, y, gripper]`
@@ -81,7 +81,7 @@ WorldModel 的闭环结构可以直接借鉴：
 2. 仿真器依赖确认
    - 决定是在 FastWAM 仓库内新增 `auto-atomic-operation` submodule，还是复用 `/DATA/disk1/zoyo/WorldModel_3d/auto-atomic-operation`。
    - 第一版实现使用可配置 `--aao-root`，默认指向 FastWAM 内部 `third_party/auto-atomic-operation` submodule。
-   - submodule 跟踪 AAO `main`，当前 pin 到远端最新 `f12f75c2220ad7a7ffce54d349a323c4a431d869`，避免长期依赖 WorldModel 项目目录。
+   - submodule 跟踪 AAO `main`，当前 pin 到 DISCOVER 远端 `8a9d5c76136ba7e02e14d25646d9b614ab984081`，避免长期依赖 WorldModel 项目目录。
    - GS 渲染依赖固定到 FastWAM 内部 `third_party/GaussianRenderer` submodule。
    - 用户已确认本轮可直接补环境；后续新增依赖仍需在 progress 中记录具体变更。
 
@@ -103,7 +103,12 @@ WorldModel 的闭环结构可以直接借鉴：
    - 输出 `multicam.mp4`、`summary.json`、`client_trace.json.gz`、`aggregate_summary.json`。
    - trace 中显式记录 `chunk_action_index` 和 `repeat_index`，用于确认每个模型 action 被重复了多少个仿真 update。
 
-6. 验证顺序
+6. 视觉对比 rollout
+   - 新增 `scripts/run_aao_visual_rollout.py`，用于输出 pred / VAE recon / actual simulator 的 3x2 拼接视频。
+   - `--frame-sampling model-action` 每个模型 action 输出一帧；`--frame-sampling sim-update` 每个 AAO update 输出一帧。
+   - mix 20k 配置下 `action_horizon=32, num_video_frames=9`，pred/recon 每个 window 只有 9 个视频帧；sim-update 模式按最近邻展开到每个 AAO update。
+
+7. 验证顺序
    - 只初始化 simulator，不跑模型。
    - mock hold action 跑通闭环记录。
    - 加载 FastWAM 权重做单步 inference smoke test。

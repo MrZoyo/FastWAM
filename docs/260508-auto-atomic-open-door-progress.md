@@ -216,6 +216,40 @@
 - 代码默认 mix 20k 路径已从本机绝对路径改为仓库根目录下的相对路径，避免其他用户 clone 后默认参数仍指向 `/DATA/disk1/zoyo/FastWAM/...`。
 - `.gitignore` 已补充 `.hf_cache/`、`.local/`、`data.local_before_origin_main_*/`，避免本地缓存和远端同步前备份目录误提交。
 
+## 2026-05-11
+
+### 已完成
+
+- 重新检查 AAO 上游：
+  - OpenGHz upstream `main`: `5303f50e0366a0c14560da133b8c85871bf0b95d`
+  - DISCOVER submodule remote `main`: `8a9d5c76136ba7e02e14d25646d9b614ab984081`
+  - FastWAM submodule 指针已切到 DISCOVER 远端可拉取的 `8a9d5c7`，取代本地临时 merge commit `4b9f432`。
+  - `4b9f432` 和 `8a9d5c7` 的 tree 完全一致；最终使用 `8a9d5c7` 是为了保证其他用户递归 clone/submodule update 时能从 DISCOVER 远端取到 commit。
+- 新 AAO API 兼容：
+  - AAO 将 `load_task_file_hydra` 从 `auto_atom.runtime` 移到 `auto_atom.config_loader`。
+  - `SimulatorServiceClient` 已优先从 `auto_atom.config_loader` 加载，旧版本 fallback 到 `auto_atom.runtime`。
+- 新 AAO smoke 验证：
+  - `SimulatorServiceClient.connect()` 通过。
+  - `open_door_airbot_play_gs` Hydra config resolve 通过，`env_update_freq=100`，operator 为 `arm`。
+  - `open_door_airbot_play_gs` 能 `init/reset/update` 一步；默认相机 `env2_cam` 和 `eef_wrist_cam` 仍可用。
+- 永久化 visual rollout：
+  - 新增 `scripts/run_aao_visual_rollout.py`，用于生成 pred / VAE recon / actual simulator 的 3x2 对比视频。
+  - `FastWAMModelClient` 新增 `infer_joint_video()`，一次 joint 推理得到动作 chunk 和预测视频。
+  - `FastWAMModelClient` 新增 `reconstruct_video_from_model_inputs()`，用模型 VAE 对实际 AAO 观测帧做 recon。
+  - 新增 `--frame-sampling {model-action,sim-update}`：
+    - `model-action`：每个模型 action 输出一帧。
+    - `sim-update`：每个 AAO update 输出一帧。
+  - 已用 mix 20k + `open_door_airbot_play_gs` 生成过 2-window AAO update 级别视频：
+    - output: `runs/aao_closed_loop/mix20k_open_door_gs_2win_visual_simupdate_20260509/pred_vae_actual_3x2.mp4`
+    - `model_steps_used=64`
+    - `sim_updates_used=320`
+    - `output_frames=320`
+    - video shape: `672x448`, fps `10`
+  - 说明：mix 配置下 `action_horizon=32, num_video_frames=9`，pred/recon 每个 window 只有 9 个模型视频帧；`sim-update` 模式按最近邻展开到每个 AAO update，actual 行为逐 AAO update 真实取图。
+- README / README_zh 已补充：
+  - 当前 AAO submodule pin 为 `8a9d5c7`，包含 OpenGHz upstream `5303f50`。
+  - visual rollout 入口和 `--frame-sampling sim-update` 示例。
+
 ### 需要确认
 
 - open door FastWAM checkpoint 的准确路径。
