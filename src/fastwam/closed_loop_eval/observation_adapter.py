@@ -62,10 +62,14 @@ def _coerce_rgb(value: Any, fallback_hw: tuple[int, int]) -> np.ndarray:
     return rgb.astype(np.uint8, copy=False)
 
 
-def _coerce_vector(value: Any, dim: int, *, default: float = 0.0) -> np.ndarray:
+def _coerce_vector(value: Any, dim: int | None, *, default: float = 0.0) -> np.ndarray:
     if value is None:
+        if dim is None:
+            return np.zeros((0,), dtype=np.float32)
         return np.full((dim,), default, dtype=np.float32)
     array = np.asarray(value, dtype=np.float32).reshape(-1)
+    if dim is None:
+        return array.astype(np.float32, copy=False)
     if array.size < dim:
         array = np.pad(array, (0, dim - array.size), constant_values=default)
     return array[:dim].astype(np.float32, copy=False)
@@ -85,6 +89,41 @@ def _resolve_operator_names(sim_info: dict[str, Any]) -> tuple[str, str, str]:
         eef_output = op_cfg.get("eef_output_name", "eef")
         return str(operator_name), str(arm_output), str(eef_output)
     return "arm", "arm", "eef"
+
+
+def _resolve_operator_joint_dims(sim_info: dict[str, Any], operator_name: str) -> tuple[int | None, int | None]:
+    operators = sim_info.get("operators")
+    op_cfg: dict[str, Any] | None = None
+    if isinstance(operators, dict):
+        candidate = operators.get(operator_name)
+        if isinstance(candidate, dict):
+            op_cfg = candidate
+    elif isinstance(operators, list):
+        for candidate in operators:
+            if isinstance(candidate, dict) and candidate.get("name", operator_name) == operator_name:
+                op_cfg = candidate
+                break
+    if op_cfg is None:
+        return None, None
+    arm = op_cfg.get("arm_actuators")
+    eef = op_cfg.get("eef_actuators")
+    return (
+        len(arm) if isinstance(arm, list) else None,
+        len(eef) if isinstance(eef, list) else None,
+    )
+
+
+def _extract_joint_position(observation: dict[str, dict[str, Any]], limb: str) -> Any | None:
+    value = _extract_data(observation, f"{limb}/joint_state/position")
+    if value is not None:
+        return value
+    payload = observation.get(f"{limb}/joint_state")
+    if not isinstance(payload, dict):
+        return None
+    data = _squeeze_single_env(payload.get("data"))
+    if isinstance(data, dict):
+        return data.get("position")
+    return None
 
 
 def split_batched_observation(
@@ -129,6 +168,7 @@ class AAOObservationAdapter:
             raise ValueError("selected_cameras must not be empty.")
         self.history_frames = max(int(history_frames), 1)
         self.operator_name, self.arm_output_name, self.eef_output_name = _resolve_operator_names(sim_info)
+        self.arm_joint_dim, self.eef_joint_dim = _resolve_operator_joint_dims(sim_info, self.operator_name)
         self.frames: Deque[SimFrame] = deque(maxlen=self.history_frames)
 
     def reset(self) -> None:
@@ -166,8 +206,8 @@ class AAOObservationAdapter:
         arm = self.arm_output_name
         eef = self.eef_output_name
         robot_state = {
-            "arm_joint_position": _extract_data(observation, f"{arm}/joint_state/position"),
-            "eef_joint_position": _extract_data(observation, f"{eef}/joint_state/position"),
+            "arm_joint_position": _extract_joint_position(observation, arm),
+            "eef_joint_position": _extract_joint_position(observation, eef),
             "eef_position": _extract_data(observation, f"{op}/pose/position"),
             "eef_orientation_xyzw": _extract_data(observation, f"{op}/pose/orientation"),
             "eef_rotation_rpy": _extract_data(observation, f"{op}/pose/rotation"),
@@ -181,7 +221,7 @@ class AAOObservationAdapter:
             raw_observation=observation,
         )
 
-    def build_model_input(self, camera_map: dict[str, str]) -> dict[str, Any]:
+    def build_model_input(self, camera_map: dict[str, str], *, proprio_mode: str = "cartesian") -> dict[str, Any]:
         frame = self.latest_frame()
         missing = [sim_name for sim_name in camera_map.values() if sim_name not in frame.cameras]
         if missing:
@@ -189,6 +229,13 @@ class AAOObservationAdapter:
 
         cartesian = self.current_cartesian_position(frame.robot_state)
         gripper = self.current_gripper_position(frame.robot_state)
+        joint = self.current_joint_position(frame.robot_state)
+        if proprio_mode == "cartesian":
+            proprio_raw = np.concatenate([cartesian, gripper], axis=0).astype(np.float32)
+        elif proprio_mode == "joint":
+            proprio_raw = joint.astype(np.float32, copy=False)
+        else:
+            raise ValueError(f"Unsupported proprio_mode='{proprio_mode}'.")
         images = {
             train_key: frame.cameras[sim_key]["rgb"]
             for train_key, sim_key in camera_map.items()
@@ -198,8 +245,10 @@ class AAOObservationAdapter:
             "camera_map": dict(camera_map),
             "images": images,
             "cartesian_position": cartesian,
+            "joint_position": joint,
             "gripper_position": gripper,
-            "proprio_raw": np.concatenate([cartesian, gripper], axis=0).astype(np.float32),
+            "proprio_mode": proprio_mode,
+            "proprio_raw": proprio_raw,
             "sim_frame": frame,
         }
 
@@ -245,3 +294,8 @@ class AAOObservationAdapter:
     @staticmethod
     def current_gripper_position(robot_state: dict[str, Any]) -> np.ndarray:
         return _coerce_vector(robot_state.get("eef_joint_position"), 1)
+
+    def current_joint_position(self, robot_state: dict[str, Any]) -> np.ndarray:
+        arm = _coerce_vector(robot_state.get("arm_joint_position"), self.arm_joint_dim)
+        eef = _coerce_vector(robot_state.get("eef_joint_position"), self.eef_joint_dim)
+        return np.concatenate([arm, eef], axis=0).astype(np.float32)

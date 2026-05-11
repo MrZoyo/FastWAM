@@ -14,6 +14,7 @@ import numpy as np
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_AAO_ROOT = _REPO_ROOT / "third_party" / "auto-atomic-operation"
 DEFAULT_GAUSSIAN_RENDERER_ROOT = _REPO_ROOT / "third_party" / "GaussianRenderer"
+SUPPORTED_ACTION_FORMATS = {"cartesian_absolute", "joint_absolute"}
 
 
 def _load_aao_modules(aao_root: Path):
@@ -44,8 +45,15 @@ def _default_action_applier(context: Any, action: Any, env_mask: np.ndarray | No
     if action is None:
         return
     if isinstance(action, dict):
+        if "joint" in action:
+            context.backend.env.apply_joint_action(
+                action.get("operator", "arm"),
+                action["joint"],
+                env_mask=env_mask,
+            )
+            return
         context.backend.env.apply_pose_action(
-            "arm",
+            action.get("operator", "arm"),
             action["position"],
             action["orientation"],
             action["gripper"],
@@ -87,6 +95,7 @@ class SimulatorServiceClient:
         self._euler_to_quaternion: Any | None = None
         self.info: dict[str, Any] | None = None
         self.task_name = ""
+        self.action_format = "cartesian_absolute"
 
     def connect(self) -> dict[str, Any]:
         python_bin = str(Path(sys.prefix) / "bin")
@@ -115,8 +124,11 @@ class SimulatorServiceClient:
         overrides: list[str],
         action_format: str = "cartesian_absolute",
     ) -> dict[str, Any]:
-        if action_format != "cartesian_absolute":
-            raise ValueError("Only cartesian_absolute action_format is supported.")
+        if action_format not in SUPPORTED_ACTION_FORMATS:
+            raise ValueError(
+                f"Unsupported action_format='{action_format}'. "
+                f"Expected one of {sorted(SUPPORTED_ACTION_FORMATS)}."
+            )
         evaluator = self._require_evaluator()
         load_task_file_hydra = self._require_load_task_file_hydra()
         resolved_overrides = self._normalize_overrides(overrides)
@@ -131,6 +143,7 @@ class SimulatorServiceClient:
         if update_freq is not None:
             self.info["env_update_freq"] = int(update_freq)
         self.task_name = str(config_name)
+        self.action_format = str(action_format)
         return {
             "status": "ok",
             "config_name": config_name,
@@ -209,6 +222,25 @@ class SimulatorServiceClient:
         update = evaluator.update(remote_action, env_mask=mask)
         return update, remote_action
 
+    def update_joint_action(self, action_row: np.ndarray) -> tuple[Any, dict[str, np.ndarray]]:
+        return self.update_joint_actions(np.asarray(action_row, dtype=np.float32).reshape(1, -1))
+
+    def update_joint_actions(
+        self,
+        action_rows: np.ndarray,
+        env_mask: np.ndarray | None = None,
+    ) -> tuple[Any, dict[str, np.ndarray]]:
+        evaluator = self._require_evaluator()
+        batch_size = self.batch_size
+        mask = self._normalize_env_mask(batch_size, env_mask)
+        remote_action = self._expand_joint_action(
+            self._encode_joint_action(action_rows),
+            batch_size=batch_size,
+            env_mask=mask,
+        )
+        update = evaluator.update(remote_action, env_mask=mask)
+        return update, remote_action
+
     def set_cartesian_action(self, action_row: np.ndarray) -> dict[str, np.ndarray]:
         return self.set_cartesian_actions(np.asarray(action_row, dtype=np.float32).reshape(1, -1))
 
@@ -234,6 +266,27 @@ class SimulatorServiceClient:
                 remote_action["gripper"],
                 env_mask=mask,
             )
+        return remote_action
+
+    def set_joint_action(self, action_row: np.ndarray) -> dict[str, np.ndarray]:
+        return self.set_joint_actions(np.asarray(action_row, dtype=np.float32).reshape(1, -1))
+
+    def set_joint_actions(
+        self,
+        action_rows: np.ndarray,
+        env_mask: np.ndarray | None = None,
+    ) -> dict[str, np.ndarray]:
+        evaluator = self._require_evaluator()
+        batch_size = self.batch_size
+        mask = self._normalize_env_mask(batch_size, env_mask)
+        remote_action = self._expand_joint_action(
+            self._encode_joint_action(action_rows),
+            batch_size=batch_size,
+            env_mask=mask,
+        )
+        with evaluator.sim_lock:
+            ctx = evaluator._require_context()
+            ctx.backend.env.apply_joint_action("arm", remote_action["joint"], env_mask=mask)
         return remote_action
 
     def close(self) -> None:
@@ -264,6 +317,42 @@ class SimulatorServiceClient:
             "gripper": np.asarray(action_array[:, 6:7], dtype=np.float32),
         }
 
+    def _encode_joint_action(self, action_rows: np.ndarray) -> dict[str, np.ndarray]:
+        action_array = np.asarray(action_rows, dtype=np.float32)
+        if action_array.ndim == 1:
+            action_array = action_array.reshape(1, -1)
+        if action_array.ndim != 2 or action_array.shape[1] < 1:
+            raise ValueError("joint_absolute action must have shape (T, D) with D >= 1.")
+        joint_dim = self.joint_action_dim()
+        if joint_dim is not None:
+            if action_array.shape[1] < joint_dim:
+                raise ValueError(
+                    f"joint_absolute action for task '{self.task_name}' must have at least "
+                    f"{joint_dim} values, got {action_array.shape[1]}."
+                )
+            action_array = action_array[:, :joint_dim]
+        return {"joint": np.asarray(action_array, dtype=np.float32)}
+
+    def joint_action_dim(self, operator: str = "arm") -> int | None:
+        op_cfg = self._operator_info(operator)
+        if op_cfg is None:
+            return None
+        arm = op_cfg.get("arm_actuators") or []
+        eef = op_cfg.get("eef_actuators") or []
+        return len(arm) + len(eef)
+
+    def _operator_info(self, operator: str = "arm") -> dict[str, Any] | None:
+        info = self.info or {}
+        operators = info.get("operators")
+        if isinstance(operators, dict):
+            op_cfg = operators.get(operator)
+            return op_cfg if isinstance(op_cfg, dict) else None
+        if isinstance(operators, list):
+            for op_cfg in operators:
+                if isinstance(op_cfg, dict) and op_cfg.get("name", operator) == operator:
+                    return op_cfg
+        return None
+
     @staticmethod
     def _normalize_env_mask(batch_size: int, env_mask: np.ndarray | None) -> np.ndarray:
         if env_mask is None:
@@ -281,29 +370,57 @@ class SimulatorServiceClient:
         batch_size: int,
         env_mask: np.ndarray,
     ) -> dict[str, np.ndarray]:
-        selected = int(env_mask.sum())
-
-        def _expand(value: np.ndarray, trailing_shape: tuple[int, ...]) -> np.ndarray:
-            array = np.asarray(value, dtype=np.float32)
-            if array.ndim == len(trailing_shape):
-                array = array.reshape((1,) + trailing_shape)
-            if array.shape[1:] != trailing_shape:
-                raise ValueError(f"Expected trailing shape {trailing_shape}, got {array.shape}.")
-            if array.shape[0] == batch_size:
-                return array
-            if array.shape[0] == 1 and selected > 1:
-                array = np.repeat(array, selected, axis=0)
-            if array.shape[0] != selected:
-                raise ValueError(f"Action rows must match selected envs={selected}, got {array.shape[0]}.")
-            full = np.zeros((batch_size,) + trailing_shape, dtype=np.float32)
-            full[env_mask] = array
-            return full
-
         return {
-            "position": _expand(encoded["position"], (3,)),
-            "orientation": _expand(encoded["orientation"], (4,)),
-            "gripper": _expand(encoded["gripper"], (1,)),
+            "position": cls._expand_array(encoded["position"], (3,), batch_size=batch_size, env_mask=env_mask),
+            "orientation": cls._expand_array(encoded["orientation"], (4,), batch_size=batch_size, env_mask=env_mask),
+            "gripper": cls._expand_array(encoded["gripper"], (1,), batch_size=batch_size, env_mask=env_mask),
         }
+
+    @classmethod
+    def _expand_joint_action(
+        cls,
+        encoded: dict[str, np.ndarray],
+        *,
+        batch_size: int,
+        env_mask: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        joint = np.asarray(encoded["joint"], dtype=np.float32)
+        if joint.ndim == 1:
+            trailing_shape = (joint.shape[0],)
+        else:
+            trailing_shape = (joint.shape[1],)
+        return {
+            "joint": cls._expand_array(
+                joint,
+                trailing_shape,
+                batch_size=batch_size,
+                env_mask=env_mask,
+            )
+        }
+
+    @staticmethod
+    def _expand_array(
+        value: np.ndarray,
+        trailing_shape: tuple[int, ...],
+        *,
+        batch_size: int,
+        env_mask: np.ndarray,
+    ) -> np.ndarray:
+        selected = int(env_mask.sum())
+        array = np.asarray(value, dtype=np.float32)
+        if array.ndim == len(trailing_shape):
+            array = array.reshape((1,) + trailing_shape)
+        if array.shape[1:] != trailing_shape:
+            raise ValueError(f"Expected trailing shape {trailing_shape}, got {array.shape}.")
+        if array.shape[0] == batch_size:
+            return array
+        if array.shape[0] == 1 and selected > 1:
+            array = np.repeat(array, selected, axis=0)
+        if array.shape[0] != selected:
+            raise ValueError(f"Action rows must match selected envs={selected}, got {array.shape[0]}.")
+        full = np.zeros((batch_size,) + trailing_shape, dtype=np.float32)
+        full[env_mask] = array
+        return full
 
     def _normalize_overrides(self, overrides: list[str]) -> list[str]:
         resolved = list(overrides)

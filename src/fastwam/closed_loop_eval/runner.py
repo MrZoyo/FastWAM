@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 
 from .episode_recorder import EpisodeRecorder, to_jsonable
-from .model_clients import BaseModelClient, FastWAMModelClient, HoldModelClient
+from .model_clients import BaseModelClient, FastWAMModelClient, HoldJointModelClient, HoldModelClient
 from .observation_adapter import AAOObservationAdapter, split_batched_observation
 from .sim_service_client import DEFAULT_AAO_ROOT, SimulatorServiceClient
 
@@ -49,13 +49,27 @@ def _validate_camera_map(camera_map: dict[str, str], sim_info: dict[str, Any]) -
     return list(dict.fromkeys(camera_map.values()))
 
 
-def _validated_actions(action_payload: dict[str, Any]) -> np.ndarray:
-    if action_payload.get("action_format") != "cartesian_absolute":
-        raise RuntimeError("Model action_format must be 'cartesian_absolute'.")
+def _validated_actions(
+    action_payload: dict[str, Any],
+    *,
+    expected_format: str,
+    action_dim: int | None = None,
+) -> np.ndarray:
+    if action_payload.get("action_format") != expected_format:
+        raise RuntimeError(f"Model action_format must be '{expected_format}'.")
     actions = np.asarray(action_payload.get("actions"), dtype=np.float32)
-    if actions.ndim != 2 or actions.shape[1] < 7:
-        raise RuntimeError(f"Model actions must have shape [T,7+], got {actions.shape}.")
-    return actions[:, :7]
+    if actions.ndim != 2:
+        raise RuntimeError(f"Model actions must have shape [T,D], got {actions.shape}.")
+    if expected_format == "cartesian_absolute":
+        action_dim = 7 if action_dim is None else int(action_dim)
+        min_dim = 7
+    elif expected_format == "joint_absolute":
+        min_dim = 1 if action_dim is None else int(action_dim)
+    else:
+        raise RuntimeError(f"Unsupported expected action format: {expected_format}")
+    if actions.shape[1] < min_dim:
+        raise RuntimeError(f"Model actions must have shape [T,{min_dim}+], got {actions.shape}.")
+    return actions[:, :action_dim] if action_dim is not None else actions
 
 
 def _clamp_gripper(
@@ -63,14 +77,51 @@ def _clamp_gripper(
     *,
     gripper_min: float | None,
     gripper_max: float | None,
+    gripper_index: int,
 ) -> np.ndarray:
     if gripper_min is None and gripper_max is None:
         return actions
     clipped = np.asarray(actions, dtype=np.float32).copy()
+    index = int(gripper_index)
+    if index < 0:
+        index = clipped.shape[1] + index
+    if index < 0 or index >= clipped.shape[1]:
+        raise RuntimeError(f"gripper_index={gripper_index} is out of bounds for action shape {clipped.shape}.")
     low = -np.inf if gripper_min is None else float(gripper_min)
     high = np.inf if gripper_max is None else float(gripper_max)
-    clipped[:, 6] = np.clip(clipped[:, 6], low, high)
+    clipped[:, index] = np.clip(clipped[:, index], low, high)
     return clipped
+
+
+def _effective_gripper_bounds(args: argparse.Namespace) -> tuple[float | None, float | None]:
+    if args.gripper_min is not None or args.gripper_max is not None:
+        return args.gripper_min, args.gripper_max
+    if args.action_format == "cartesian_absolute":
+        return 0.02, 0.0945
+    return None, None
+
+
+def _infer_action_dim(sim_info: dict[str, Any], action_format: str, operator: str = "arm") -> int | None:
+    if action_format == "cartesian_absolute":
+        return 7
+    if action_format != "joint_absolute":
+        return None
+    operators = sim_info.get("operators")
+    op_cfg: dict[str, Any] | None = None
+    if isinstance(operators, dict):
+        candidate = operators.get(operator)
+        if isinstance(candidate, dict):
+            op_cfg = candidate
+    elif isinstance(operators, list):
+        for candidate in operators:
+            if isinstance(candidate, dict) and candidate.get("name", operator) == operator:
+                op_cfg = candidate
+                break
+    if op_cfg is None:
+        return None
+    arm = op_cfg.get("arm_actuators") or []
+    eef = op_cfg.get("eef_actuators") or []
+    return len(arm) + len(eef)
 
 
 def _resolve_control_mode(args: argparse.Namespace) -> str:
@@ -102,6 +153,7 @@ def _control_metadata(
     aao_update_hz = None if sim_info is None else sim_info.get("env_update_freq")
     control_mode = _resolve_control_mode(args)
     sim_loop_frequency = _effective_sim_loop_frequency(args)
+    gripper_min, gripper_max = _effective_gripper_bounds(args)
     effective_action_hz = None
     if control_mode == "continuous" and sim_loop_frequency > 0:
         effective_action_hz = sim_loop_frequency / float(args.action_repeat)
@@ -117,8 +169,11 @@ def _control_metadata(
         "train_action_hz": float(getattr(args, "train_action_hz", 20.0)),
         "aao_update_hz": None if aao_update_hz is None else float(aao_update_hz),
         "effective_action_hz_in_sim": effective_action_hz,
-        "gripper_min": args.gripper_min,
-        "gripper_max": args.gripper_max,
+        "action_format": args.action_format,
+        "proprio_mode": args.proprio_mode,
+        "gripper_min": gripper_min,
+        "gripper_max": gripper_max,
+        "gripper_index": int(args.gripper_index),
         "ignore_done": bool(getattr(args, "ignore_done", False)),
         "stop_on_done": not bool(getattr(args, "ignore_done", False)),
         "control_mode": control_mode,
@@ -189,6 +244,8 @@ def _numeric_delta(final: Any, initial: Any) -> Any:
 def _build_model_client(args: argparse.Namespace) -> BaseModelClient:
     if args.model_client == "hold":
         return HoldModelClient(horizon=args.action_horizon)
+    if args.model_client == "hold-joint":
+        return HoldJointModelClient(horizon=args.action_horizon)
     if args.model_client == "fastwam":
         return FastWAMModelClient(
             config_path=args.fastwam_config,
@@ -201,6 +258,8 @@ def _build_model_client(args: argparse.Namespace) -> BaseModelClient:
             num_inference_steps=args.num_inference_steps,
             seed=args.seed,
             rand_device=args.rand_device,
+            action_mode=args.model_action_mode,
+            output_action_format=args.output_action_format or args.action_format,
         )
     raise ValueError(f"Unsupported model client: {args.model_client}")
 
@@ -230,9 +289,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         init_result = sim.init(
             config_name=args.task,
             overrides=list(args.override),
-            action_format="cartesian_absolute",
+            action_format=args.action_format,
         )
         sim_info = init_result["info"]
+        action_dim = _infer_action_dim(sim_info, args.action_format)
+        gripper_min, gripper_max = _effective_gripper_bounds(args)
         control_mode = _resolve_control_mode(args)
         continuous_hold_sec = _continuous_hold_seconds(args, sim_info)
         camera_map = _parse_camera_map(args.camera_map)
@@ -257,6 +318,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "selected_cameras": selected_cameras,
                 "stage_plans": sim.stage_plans,
                 "model_client": args.model_client,
+                "model_action_mode": getattr(args, "model_action_mode", None),
                 "control": _control_metadata(args, sim_info=sim_info),
             }
             error: str | None = None
@@ -286,18 +348,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     sim_frame=adapter.latest_frame(),
                     update=None,
                     action_cartesian=None,
+                    action=None,
+                    action_format=args.action_format,
                     remote_action=None,
                     model_response=None,
                 )
 
                 chunk_index = 0
                 while updates_used < args.max_updates:
-                    model_input = adapter.build_model_input(camera_map)
+                    model_input = adapter.build_model_input(camera_map, proprio_mode=args.proprio_mode)
                     model_response = model_client.infer(model_input)
                     actions = _clamp_gripper(
-                        _validated_actions(model_response),
-                        gripper_min=args.gripper_min,
-                        gripper_max=args.gripper_max,
+                        _validated_actions(
+                            model_response,
+                            expected_format=args.action_format,
+                            action_dim=action_dim,
+                        ),
+                        gripper_min=gripper_min,
+                        gripper_max=gripper_max,
+                        gripper_index=args.gripper_index,
                     )
                     remaining_updates = args.max_updates - updates_used
                     chunk_steps = min(
@@ -310,7 +379,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         action = actions[chunk_step_index]
                         repeat_steps = min(args.action_repeat, args.max_updates - updates_used)
                         if control_mode == "continuous":
-                            remote_action = sim.set_cartesian_action(action)
+                            if args.action_format == "joint_absolute":
+                                remote_action = sim.set_joint_action(action)
+                            else:
+                                remote_action = sim.set_cartesian_action(action)
                             if continuous_hold_sec > 0:
                                 time.sleep(continuous_hold_sec)
                             updates_used += repeat_steps
@@ -326,7 +398,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                                 repeat_index=repeat_steps - 1,
                                 sim_frame=adapter.latest_frame(),
                                 update=task_state,
-                                action_cartesian=action,
+                                action_cartesian=action if args.action_format == "cartesian_absolute" else None,
+                                action=action,
+                                action_format=args.action_format,
                                 remote_action=remote_action,
                                 model_response=model_response if chunk_step_index == 0 else None,
                             )
@@ -335,7 +409,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                                 episode_done = True
                         else:
                             for repeat_index in range(repeat_steps):
-                                update, remote_action = sim.update_cartesian_action(action)
+                                if args.action_format == "joint_absolute":
+                                    update, remote_action = sim.update_joint_action(action)
+                                else:
+                                    update, remote_action = sim.update_cartesian_action(action)
                                 updates_used += 1
                                 obs = sim.get_observation()
                                 observations = split_batched_observation(obs, sim.batch_size)
@@ -348,7 +425,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                                     repeat_index=repeat_index,
                                     sim_frame=adapter.latest_frame(),
                                     update=update,
-                                    action_cartesian=action,
+                                    action_cartesian=action if args.action_format == "cartesian_absolute" else None,
+                                    action=action,
+                                    action_format=args.action_format,
                                     remote_action=remote_action,
                                     model_response=model_response if chunk_step_index == 0 and repeat_index == 0 else None,
                                 )
@@ -429,16 +508,21 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--stride", type=int, default=8)
     parser.add_argument("--action-repeat", type=int, default=5)
     parser.add_argument("--action-horizon", type=int, default=32)
+    parser.add_argument("--action-format", choices=("cartesian_absolute", "joint_absolute"), default="cartesian_absolute")
+    parser.add_argument("--proprio-mode", choices=("cartesian", "joint"), default="cartesian")
     parser.add_argument("--train-action-hz", type=float, default=20.0)
-    parser.add_argument("--gripper-min", type=float, default=0.02)
-    parser.add_argument("--gripper-max", type=float, default=0.0945)
+    parser.add_argument("--gripper-min", type=float, default=None)
+    parser.add_argument("--gripper-max", type=float, default=None)
+    parser.add_argument("--gripper-index", type=int, default=-1)
     parser.add_argument("--camera-map", default="head_left=env2_cam,right_wrist_left=eef_wrist_cam")
-    parser.add_argument("--model-client", choices=("hold", "fastwam"), default="hold")
+    parser.add_argument("--model-client", choices=("hold", "hold-joint", "fastwam"), default="hold")
     parser.add_argument("--fastwam-config", default=str(DEFAULT_MIX_CONFIG))
     parser.add_argument("--checkpoint", default=str(DEFAULT_MIX_CKPT))
     parser.add_argument("--dataset-stats", default=str(DEFAULT_MIX_STATS))
     parser.add_argument("--text-cache-dir", default="data/text_embeds_cache/mix")
     parser.add_argument("--instruction", default="open the door")
+    parser.add_argument("--model-action-mode", choices=("delta6_abs_gripper", "absolute", "absolute_joint"), default="delta6_abs_gripper")
+    parser.add_argument("--output-action-format", choices=("cartesian_absolute", "joint_absolute"), default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--num-inference-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)

@@ -13,13 +13,14 @@
 
 本仓库包含 FastWAM 在 LIBERO / RoboTwin 上的训练与评估代码。
 
-## AAO Open Door 闭环仿真集成
+## AAO 闭环仿真集成
 
-当前工作区额外集成了 `auto-atomic-operation`（AAO），用于 GS 版本
-open door 任务的闭环仿真验证。这部分和训练主流程解耦：
+当前工作区额外集成了 `auto-atomic-operation`（AAO），用于闭环仿真验证。
+目前桥接代码支持 GS 版本 open door Airbot Play 场景，以及非 GS 的 P7 cup
+场景。这部分和训练主流程解耦：
 
 - AAO 以 submodule 形式放在 `third_party/auto-atomic-operation`，当前 pin
-  到 DISCOVER fork 的 `8a9d5c7`，该版本包含 OpenGHz 上游 `5303f50`。
+  到 DISCOVER fork 的 `449119b`，该版本包含上游重命名提交 `d1530c7`。
 - Gaussian renderer 以 submodule 形式放在 `third_party/GaussianRenderer`。
 - FastWAM 到 AAO 的闭环桥接代码在 `src/fastwam/closed_loop_eval/`。
 - 单 episode 入口：`scripts/run_aao_closed_loop_eval.py`。
@@ -62,6 +63,30 @@ embedding cache 和 checkpoint；如果使用别的 run，用 `--fastwam-config`
   --gripper-max 0.0945 \
   --sim-loop-frequency 0
 ```
+
+上游 P7 cup UMI 任务已经从 `cup_on_coaster_gs_airbot_p7_umi` 重命名为
+`cup_on_coaster_airbot_p7_umi`。虽然 AAO 配置里 MuJoCo model 名仍是
+`demo_gs.xml`，这个任务没有启用 GS renderer；它是非 GS MuJoCo 场景，
+动作是 7 个 P7 关节加 1 个 UMI 夹爪距离命令。这个环境需要使用
+`joint_absolute` action 和 joint proprio：
+
+```bash
+.venv/bin/python -B scripts/run_aao_closed_loop_eval.py \
+  --task cup_on_coaster_airbot_p7_umi \
+  --model-client hold-joint \
+  --action-format joint_absolute \
+  --proprio-mode joint \
+  --camera-map head_left=env1_cam,right_wrist_left=eef_wrist_cam \
+  --episodes 1 \
+  --max-updates 2 \
+  --stride 1 \
+  --action-repeat 1 \
+  --no-video
+```
+
+后续用新训练的 P7 joint 模型评测时，仿真参数保持上面这套，模型侧改成
+直接输出绝对 joint action，例如：
+`--model-client fastwam --model-action-mode absolute_joint --output-action-format joint_absolute`。
 
 注意：当前 AAO `final_success` 不能单独作为真实开门成功标准。需要同时
 检查 `multicam.mp4` 和 `client_trace.json.gz` / `aggregate_summary.json`
@@ -184,7 +209,7 @@ huggingface-cli download OpenGHz/auto-atom-assets \
 
 ## 目录
 
-- [AAO Open Door 闭环仿真集成](#aao-open-door-闭环仿真集成)
+- [AAO 闭环仿真集成](#aao-闭环仿真集成)
   - [AAO 部署](#aao-部署)
 - [File Structure](#file-structure)
 - [环境安装](#环境安装)

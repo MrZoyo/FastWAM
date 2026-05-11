@@ -13,15 +13,16 @@ Official codebase for **Fast-WAM: Do World Action Models Need Test-time Future I
 
 This repository contains the training and evaluation code for FastWAM on LIBERO / RoboTwin.
 
-## AAO Open Door Closed-Loop Integration
+## AAO Closed-Loop Integration
 
 This workspace also contains a local integration of FastWAM with
-`auto-atomic-operation` (AAO) for GS open-door closed-loop validation. The
-integration is intentionally kept separate from the training pipeline:
+`auto-atomic-operation` (AAO) for closed-loop simulator validation. The current
+bridge supports the GS open-door Airbot Play setup and the non-GS P7 cup task.
+The integration is intentionally kept separate from the training pipeline:
 
 - AAO is vendored as `third_party/auto-atomic-operation` and pinned to the
-  latest DISCOVER fork commit used for open-door compatibility. The current
-  pin is `8a9d5c7`, which includes OpenGHz upstream `5303f50`.
+  latest DISCOVER fork commit used here. The current pin is `449119b`, which
+  includes the upstream rename commit `d1530c7`.
 - Gaussian rendering support is vendored as `third_party/GaussianRenderer`.
 - The FastWAM closed-loop bridge lives in `src/fastwam/closed_loop_eval/`.
 - Single-episode evaluation entrypoint:
@@ -67,6 +68,31 @@ settings are:
   --gripper-max 0.0945 \
   --sim-loop-frequency 0
 ```
+
+The upstream P7 cup UMI task was renamed from
+`cup_on_coaster_gs_airbot_p7_umi` to `cup_on_coaster_airbot_p7_umi`. Despite
+the `demo_gs.xml` MuJoCo model name inside AAO, this task does not enable the
+GS renderer; it is a non-GS MuJoCo scene with 7 P7 arm joints plus one UMI
+gripper distance command. Use `joint_absolute` actions and joint proprio for
+that environment:
+
+```bash
+.venv/bin/python -B scripts/run_aao_closed_loop_eval.py \
+  --task cup_on_coaster_airbot_p7_umi \
+  --model-client hold-joint \
+  --action-format joint_absolute \
+  --proprio-mode joint \
+  --camera-map head_left=env1_cam,right_wrist_left=eef_wrist_cam \
+  --episodes 1 \
+  --max-updates 2 \
+  --stride 1 \
+  --action-repeat 1 \
+  --no-video
+```
+
+When evaluating a newly trained P7 joint model, keep the simulator flags above
+and switch the model side to direct absolute joint output, for example:
+`--model-client fastwam --model-action-mode absolute_joint --output-action-format joint_absolute`.
 
 Important caveat: AAO `final_success` alone is not a reliable open-door
 criterion for the current setup. Always inspect `multicam.mp4` and the
@@ -192,7 +218,7 @@ backgrounds, and the shared `real_knob1.ply` / `real_lock1.ply` handle assets:
 
 ## Index
 
-- [AAO Open Door Closed-Loop Integration](#aao-open-door-closed-loop-integration)
+- [AAO Closed-Loop Integration](#aao-closed-loop-integration)
   - [AAO Setup](#aao-setup)
 - [File Structure](#file-structure)
 - [Environment Setup](#environment-setup)

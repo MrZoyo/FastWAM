@@ -77,7 +77,7 @@ def _prepare_model_cfg_for_checkpoint_inference(cfg: DictConfig) -> None:
 class BaseModelClient(ABC):
     @abstractmethod
     def infer(self, model_input: dict[str, Any]) -> dict[str, Any]:
-        """Return a chunked action payload with cartesian_absolute actions."""
+        """Return a chunked action payload with model actions."""
 
     def close(self) -> None:
         return None
@@ -97,6 +97,21 @@ class HoldModelClient(BaseModelClient):
             "action_format": "cartesian_absolute",
             "actions": np.repeat(action[None, :], self.horizon, axis=0),
             "source": "hold",
+        }
+
+
+class HoldJointModelClient(BaseModelClient):
+    def __init__(self, *, horizon: int = 32) -> None:
+        self.horizon = int(horizon)
+
+    def infer(self, model_input: dict[str, Any]) -> dict[str, Any]:
+        joint = np.asarray(model_input["joint_position"], dtype=np.float32).reshape(-1)
+        if joint.size < 1:
+            raise RuntimeError("HoldJointModelClient requires joint_position.")
+        return {
+            "action_format": "joint_absolute",
+            "actions": np.repeat(joint[None, :], self.horizon, axis=0),
+            "source": "hold_joint",
         }
 
 
@@ -133,8 +148,12 @@ class FastWAMModelClient(BaseModelClient):
         self.output_action_format = str(output_action_format)
         self.call_index = 0
 
-        if self.action_mode != "delta6_abs_gripper":
-            raise ValueError("Only action_mode='delta6_abs_gripper' is currently supported.")
+        supported_action_modes = {"delta6_abs_gripper", "absolute", "absolute_joint"}
+        if self.action_mode not in supported_action_modes:
+            raise ValueError(
+                f"Unsupported action_mode='{self.action_mode}'. "
+                f"Expected one of {sorted(supported_action_modes)}."
+            )
 
         self.cfg = load_fastwam_config(self.config_path)
         _prepare_model_cfg_for_checkpoint_inference(self.cfg)
@@ -194,15 +213,11 @@ class FastWAMModelClient(BaseModelClient):
                 rand_device=self.rand_device,
             )
         action_norm = output["action"].detach().to(device="cpu", dtype=torch.float32)
-        denorm_delta = self._denormalize_action(action_norm, proprio_norm)
-        current_position = self._resolve_current_position(model_input)
-        absolute = self._delta_to_absolute(
-            denorm_delta,
-            current_position,
-        )
+        denorm_action = self._denormalize_action(action_norm, proprio_norm)
+        actions = self._format_actions(denorm_action, model_input)
         return {
             "action_format": self.output_action_format,
-            "actions": absolute.astype(np.float32, copy=False),
+            "actions": actions.astype(np.float32, copy=False),
             "source": "fastwam",
             "action_mode": self.action_mode,
             "normalized_action_shape": list(action_norm.shape),
@@ -251,15 +266,11 @@ class FastWAMModelClient(BaseModelClient):
                 test_action_with_infer_action=test_action_with_infer_action,
         )
         action_norm = output["action"].detach().to(device="cpu", dtype=torch.float32)
-        denorm_delta = self._denormalize_action(action_norm, proprio_norm)
-        current_position = self._resolve_current_position(model_input)
-        absolute = self._delta_to_absolute(
-            denorm_delta,
-            current_position,
-        )
+        denorm_action = self._denormalize_action(action_norm, proprio_norm)
+        actions = self._format_actions(denorm_action, model_input)
         return {
             "action_format": self.output_action_format,
-            "actions": absolute.astype(np.float32, copy=False),
+            "actions": actions.astype(np.float32, copy=False),
             "video": list(output["video"]),
             "source": "fastwam_joint_video",
             "action_mode": self.action_mode,
@@ -343,6 +354,14 @@ class FastWAMModelClient(BaseModelClient):
         }
         merged_batch = self.processor.action_state_merger.forward(merged_batch)
         return merged_batch["action"].detach().cpu().numpy().astype(np.float32)
+
+    def _format_actions(self, denorm_action: np.ndarray, model_input: dict[str, Any]) -> np.ndarray:
+        if self.action_mode == "delta6_abs_gripper":
+            current_position = self._resolve_current_position(model_input)
+            return self._delta_to_absolute(denorm_action, current_position)
+        if self.action_mode in {"absolute", "absolute_joint"}:
+            return np.asarray(denorm_action, dtype=np.float32)
+        raise ValueError(f"Unsupported action_mode='{self.action_mode}'.")
 
     def _delta_to_absolute(self, action_delta: np.ndarray, current_cartesian: np.ndarray) -> np.ndarray:
         action = np.asarray(action_delta, dtype=np.float32).copy()
