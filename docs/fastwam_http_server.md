@@ -10,7 +10,7 @@ The default service target is `real_1048_uncond_2cam224_1e-4`.
 Required local paths:
 
 - dataset: `/data_hdd/Lyle/Datasets/real_1048`
-- checkpoint: `runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/checkpoints/weights/step_015000.pt`
+- checkpoint: `runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/checkpoints/weights/step_020000.pt`
 - dataset stats: `runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/dataset_stats.json`
 - text cache: `data/text_embeds_cache/real_1048`
 
@@ -48,7 +48,7 @@ From `/home/Lyle/Projects/FastWAM`:
   --host 0.0.0.0 \
   --port 8117 \
   --config configs/task/real_1048_uncond_2cam224_1e-4.yaml \
-  --checkpoint runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/checkpoints/weights/step_015000.pt \
+  --checkpoint runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/checkpoints/weights/step_020000.pt \
   --dataset-stats runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/dataset_stats.json \
   --text-cache-dir data/text_embeds_cache/real_1048
 ```
@@ -101,6 +101,6 @@ computed as predicted delta plus the current six joint values; the last dimensio
 
 ## Verified On 5090
 
-- `GET /health` reports `image_keys=["head_left","right_wrist_left"]`, `proprio_dim=7`, and checkpoint `step_015000.pt`.
+- `GET /health` reports `image_keys=["head_left","right_wrist_left"]`, `proprio_dim=7`, and checkpoint `step_020000.pt`.
 - A real dataset frame from `/data_hdd/Lyle/Datasets/real_1048` returns HTTP 200 with `action_format="joint_absolute"` and `actions` shape `[32,7]`.
 - Malformed requests return HTTP 400, including non-7D `proprio_raw` and missing camera keys.

@@ -5,7 +5,7 @@ Start from the repo root:
 
   .venv/bin/python -B scripts/fastwam_http_server.py \
     --config configs/task/real_1048_uncond_2cam224_1e-4.yaml \
-    --checkpoint runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/checkpoints/weights/step_015000.pt \
+    --checkpoint runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/checkpoints/weights/step_020000.pt \
     --dataset-stats runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/dataset_stats.json \
     --text-cache-dir data/text_embeds_cache/real_1048
 
@@ -226,7 +226,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="configs/task/real_1048_uncond_2cam224_1e-4.yaml")
     parser.add_argument(
         "--checkpoint",
-        default="runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/checkpoints/weights/step_015000.pt",
+        default="runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/checkpoints/weights/step_020000.pt",
     )
     parser.add_argument(
         "--dataset-stats",
