@@ -78,9 +78,11 @@ are `open_door_airbot_play_gs` and `cup_on_coaster_gs_airbot_p7`; new test envs
 can be supplied with `--profile-config <yaml>`. Both preset profiles use 7D EEF
 pose + gripper model actions and send `cartesian_absolute` commands to AAO. The
 cup profile uses 8D joint + gripper proprio as model input, but it does not use
-`joint_absolute` control. Batch benchmark currently supports lockstep only,
-that is `--sim-loop-frequency 0`. For multi-env and multi-model-GPU benchmark
-usage, see `docs/aao_benchmark.md`.
+`joint_absolute` control. The cup checkpoint/profile is only validated for the
+`cup_on_coaster_gs_airbot_p7` AAO task; do not override it to
+`cup_on_coaster_airbot_p7_umi` or other UMI v3 tasks. Batch benchmark currently
+supports lockstep only, that is `--sim-loop-frequency 0`. For multi-env and
+multi-model-GPU benchmark usage, see `docs/aao_benchmark.md`.
 
 Important caveat: AAO `success_rate` / `final_success` alone is not a reliable
 open-door criterion for the current setup. Batch benchmark records `stage_name`,

@@ -72,8 +72,10 @@ batch benchmark 的 profile 配置在 `configs/aao_benchmark/`，当前预设
 `--profile-config <yaml>` 接入新的测试 env。两个预设 profile 的模型输出都按
 7D EEF pose + gripper 处理，并统一向 AAO 下发 `cartesian_absolute`；cup
 profile 的模型输入 state 是 8D joint + gripper，但不走 `joint_absolute`
-控制。batch benchmark 当前只支持 lockstep，即 `--sim-loop-frequency 0`。
-多 env、多模型 GPU 的 benchmark 用法见 `docs/aao_benchmark.md`。
+控制。cup checkpoint/profile 只验证 `cup_on_coaster_gs_airbot_p7` 这个 AAO
+task，不要覆盖成 `cup_on_coaster_airbot_p7_umi` 或其他 UMI v3 场景。batch
+benchmark 当前只支持 lockstep，即 `--sim-loop-frequency 0`。多 env、多模型
+GPU 的 benchmark 用法见 `docs/aao_benchmark.md`。
 
 注意：当前 AAO `success_rate` / `final_success` 不能单独作为真实开门成功标准。
 batch benchmark 会在 `benchmark_results.csv` / `benchmark_results.jsonl` 中记录

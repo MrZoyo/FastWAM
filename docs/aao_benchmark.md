@@ -54,6 +54,9 @@ text_cache_dir: data/text_embeds_cache/mix
 - benchmark 统一向 AAO 下发 `cartesian_absolute`。
 - 不支持 `joint_absolute` 控制；cup 只是模型输入 state 使用 8D joint + gripper。
 - 两个 profile 的模型输出都必须是 7D action：`[x, y, z, roll, pitch, yaw, gripper]`。
+- cup 只使用 `cup_on_coaster_gs_airbot_p7`。不要把 cup profile 的 `task` 覆盖成
+  `cup_on_coaster_airbot_p7_umi` 或其他 UMI v3 场景；这些场景没有作为 FastWAM
+  cup benchmark 的有效目标。
 - `fastwam_config` 和 `text_cache_dir` 在 YAML 中可以写仓库相对路径。
 - `checkpoint` 和 `dataset_stats` 不写进 profile，正式模型评测时必须显式传入。
 - 默认会关闭 depth、mask、heat map，只取 RGB，避免 GS segmentation 相关崩溃并减少开销。
@@ -212,6 +215,9 @@ open-door profile 的默认 `action_repeat=5`，用于把 20Hz 训练 action 对
 100Hz AAO update。
 
 ## cup 模型测试
+
+cup 测试只针对 `cup_on_coaster_gs_airbot_p7`。不要额外传
+`--task cup_on_coaster_airbot_p7_umi`，也不要用 UMI v3 场景替换这个 profile。
 
 本地已验证过的 cup checkpoint 示例：
 
