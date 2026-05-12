@@ -77,6 +77,16 @@ def _select_config_value(config: Any, path: str) -> Any:
     return current
 
 
+def _set_env_or_fail_on_conflict(key: str, value: str, *, reason: str) -> None:
+    existing = os.environ.get(key)
+    if existing is not None and existing != value:
+        raise RuntimeError(
+            f"{key} is already set to {existing!r}, but {reason} requires {value!r}. "
+            f"Unset {key} or pass matching GPU settings explicitly."
+        )
+    os.environ[key] = value
+
+
 class SimulatorServiceClient:
     def __init__(
         self,
@@ -105,9 +115,10 @@ class SimulatorServiceClient:
         os.environ.setdefault("MUJOCO_GL", "egl")
         if self.gpu >= 0:
             gpu_str = str(self.gpu)
-            os.environ.setdefault("CUDA_VISIBLE_DEVICES", gpu_str)
-            os.environ.setdefault("EGL_VISIBLE_DEVICES", gpu_str)
-            os.environ.setdefault("MUJOCO_EGL_DEVICE_ID", gpu_str)
+            reason = f"AAO simulator --gpu={gpu_str}"
+            _set_env_or_fail_on_conflict("CUDA_VISIBLE_DEVICES", gpu_str, reason=reason)
+            _set_env_or_fail_on_conflict("EGL_VISIBLE_DEVICES", gpu_str, reason=reason)
+            _set_env_or_fail_on_conflict("MUJOCO_EGL_DEVICE_ID", gpu_str, reason=reason)
         policy_evaluator, load_task_file_hydra, euler_to_quaternion = _load_aao_modules(self.aao_root)
         self._load_task_file_hydra = load_task_file_hydra
         self._euler_to_quaternion = euler_to_quaternion
@@ -164,8 +175,14 @@ class SimulatorServiceClient:
     def get_task_state(self) -> dict[str, Any]:
         task_update = self._require_evaluator()._build_task_update()
         return {
+            "stage_index": task_update.stage_index,
+            "stage_name": task_update.stage_name,
+            "status": task_update.status,
             "done": np.asarray(task_update.done, dtype=bool),
             "success": task_update.success,
+            "details": task_update.details,
+            "phase": task_update.phase,
+            "phase_step": task_update.phase_step,
         }
 
     def summarize(
@@ -298,9 +315,9 @@ class SimulatorServiceClient:
         action_array = np.asarray(action_rows, dtype=np.float32)
         if action_array.ndim == 1:
             action_array = action_array.reshape(1, -1)
-        if action_array.ndim != 2 or action_array.shape[1] < 7:
+        if action_array.ndim != 2 or action_array.shape[1] != 7:
             raise ValueError(
-                "cartesian_absolute action must have shape (T, 7+) with "
+                "cartesian_absolute action must have shape (T, 7) with "
                 "[x, y, z, roll, pitch, yaw, gripper]."
             )
         euler_to_quaternion = self._require_euler_to_quaternion()
@@ -325,12 +342,11 @@ class SimulatorServiceClient:
             raise ValueError("joint_absolute action must have shape (T, D) with D >= 1.")
         joint_dim = self.joint_action_dim()
         if joint_dim is not None:
-            if action_array.shape[1] < joint_dim:
+            if action_array.shape[1] != joint_dim:
                 raise ValueError(
-                    f"joint_absolute action for task '{self.task_name}' must have at least "
+                    f"joint_absolute action for task '{self.task_name}' must have exactly "
                     f"{joint_dim} values, got {action_array.shape[1]}."
                 )
-            action_array = action_array[:, :joint_dim]
         return {"joint": np.asarray(action_array, dtype=np.float32)}
 
     def joint_action_dim(self, operator: str = "arm") -> int | None:
@@ -414,8 +430,6 @@ class SimulatorServiceClient:
             raise ValueError(f"Expected trailing shape {trailing_shape}, got {array.shape}.")
         if array.shape[0] == batch_size:
             return array
-        if array.shape[0] == 1 and selected > 1:
-            array = np.repeat(array, selected, axis=0)
         if array.shape[0] != selected:
             raise ValueError(f"Action rows must match selected envs={selected}, got {array.shape[0]}.")
         full = np.zeros((batch_size,) + trailing_shape, dtype=np.float32)

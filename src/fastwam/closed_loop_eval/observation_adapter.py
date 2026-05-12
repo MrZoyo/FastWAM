@@ -50,29 +50,33 @@ def _infer_timestamp_ns(observation: dict[str, dict[str, Any]]) -> float:
     return 0.0
 
 
-def _coerce_rgb(value: Any, fallback_hw: tuple[int, int]) -> np.ndarray:
+def _coerce_rgb(value: Any, *, camera_name: str) -> np.ndarray:
     if value is None:
-        height, width = fallback_hw
-        return np.zeros((height, width, 3), dtype=np.uint8)
+        raise RuntimeError(f"Missing RGB observation for AAO camera '{camera_name}'.")
     rgb = np.asarray(value)
-    if rgb.ndim == 2:
-        rgb = np.repeat(rgb[..., None], 3, axis=2)
-    if rgb.shape[-1] > 3:
-        rgb = rgb[..., :3]
+    if rgb.ndim != 3:
+        raise RuntimeError(
+            f"Expected RGB observation for AAO camera '{camera_name}' to have shape [H,W,3], got {rgb.shape}."
+        )
+    if rgb.shape[-1] != 3:
+        raise RuntimeError(
+            f"Expected RGB observation for AAO camera '{camera_name}' to have 3 channels, got shape {rgb.shape}."
+        )
     return rgb.astype(np.uint8, copy=False)
 
 
-def _coerce_vector(value: Any, dim: int | None, *, default: float = 0.0) -> np.ndarray:
+def _coerce_vector(value: Any, dim: int | None, *, name: str) -> np.ndarray:
     if value is None:
-        if dim is None:
-            return np.zeros((0,), dtype=np.float32)
-        return np.full((dim,), default, dtype=np.float32)
+        expected = "non-empty" if dim is None else f"{dim}D"
+        raise RuntimeError(f"Missing {name}; expected {expected} vector from AAO observation.")
     array = np.asarray(value, dtype=np.float32).reshape(-1)
     if dim is None:
+        if array.size == 0:
+            raise RuntimeError(f"AAO observation field '{name}' is empty.")
         return array.astype(np.float32, copy=False)
-    if array.size < dim:
-        array = np.pad(array, (0, dim - array.size), constant_values=default)
-    return array[:dim].astype(np.float32, copy=False)
+    if array.size != dim:
+        raise RuntimeError(f"AAO observation field '{name}' expected {dim} values, got {array.size}.")
+    return array.astype(np.float32, copy=False)
 
 
 def _resolve_operator_names(sim_info: dict[str, Any]) -> tuple[str, str, str]:
@@ -88,7 +92,7 @@ def _resolve_operator_names(sim_info: dict[str, Any]) -> tuple[str, str, str]:
         arm_output = op_cfg.get("arm_output_name") or operator_name
         eef_output = op_cfg.get("eef_output_name", "eef")
         return str(operator_name), str(arm_output), str(eef_output)
-    return "arm", "arm", "eef"
+    raise RuntimeError("AAO sim_info does not contain operator metadata.")
 
 
 def _resolve_operator_joint_dims(sim_info: dict[str, Any], operator_name: str) -> tuple[int | None, int | None]:
@@ -186,10 +190,9 @@ class AAOObservationAdapter:
     def parse_observation(self, observation: dict[str, dict[str, Any]]) -> SimFrame:
         cameras: dict[str, dict[str, Any]] = {}
         for camera_name in self.selected_cameras:
-            fallback_hw = self._camera_hw(camera_name)
             rgb = _coerce_rgb(
                 _extract_data(observation, f"{camera_name}/color/image_raw"),
-                fallback_hw=fallback_hw,
+                camera_name=camera_name,
             )
             cameras[camera_name] = {
                 "rgb": rgb,
@@ -252,50 +255,51 @@ class AAOObservationAdapter:
             "sim_frame": frame,
         }
 
-    def _camera_hw(self, camera_name: str) -> tuple[int, int]:
-        info = self.sim_info.get("cameras", {}).get(camera_name, {})
-        color_info = info.get("camera_info", {}).get("color", {})
-        depth_info = info.get("camera_info", {}).get("depth", {})
-        height = int(color_info.get("height", depth_info.get("height", 480)))
-        width = int(color_info.get("width", depth_info.get("width", 640)))
-        return height, width
-
     def _camera_intrinsics(self, camera_name: str) -> np.ndarray:
-        info = self.sim_info.get("cameras", {}).get(camera_name, {})
+        info = self.sim_info.get("cameras", {}).get(camera_name)
+        if not isinstance(info, dict):
+            raise RuntimeError(f"AAO sim_info is missing camera metadata for '{camera_name}'.")
         color_k = info.get("camera_info", {}).get("color", {}).get("k")
         depth_k = info.get("camera_info", {}).get("depth", {}).get("k")
         k = color_k if color_k is not None else depth_k
         if k is None:
-            return np.zeros((3, 3), dtype=np.float32)
-        return np.asarray(k, dtype=np.float32).reshape(3, 3)
+            raise RuntimeError(f"AAO sim_info camera '{camera_name}' is missing color/depth intrinsics.")
+        matrix = np.asarray(k, dtype=np.float32)
+        if matrix.size != 9:
+            raise RuntimeError(f"AAO sim_info camera '{camera_name}' intrinsics expected 9 values, got {matrix.size}.")
+        return matrix.reshape(3, 3)
 
     def _camera_extrinsics(self, camera_name: str) -> np.ndarray:
-        info = self.sim_info.get("cameras", {}).get(camera_name, {})
+        info = self.sim_info.get("cameras", {}).get(camera_name)
+        if not isinstance(info, dict):
+            raise RuntimeError(f"AAO sim_info is missing camera metadata for '{camera_name}'.")
         extr = info.get("camera_extrinsics")
+        if not isinstance(extr, dict):
+            raise RuntimeError(f"AAO sim_info camera '{camera_name}' is missing extrinsics.")
+        if "rotation_matrix" not in extr or "translation" not in extr:
+            raise RuntimeError(f"AAO sim_info camera '{camera_name}' extrinsics must include rotation_matrix and translation.")
+        rotation = np.asarray(extr["rotation_matrix"], dtype=np.float32)
+        translation = np.asarray(extr["translation"], dtype=np.float32)
+        if rotation.size != 9:
+            raise RuntimeError(f"AAO sim_info camera '{camera_name}' rotation_matrix expected 9 values, got {rotation.size}.")
+        if translation.size != 3:
+            raise RuntimeError(f"AAO sim_info camera '{camera_name}' translation expected 3 values, got {translation.size}.")
         matrix = np.eye(4, dtype=np.float32)
-        if not extr:
-            return matrix
-        matrix[:3, :3] = np.asarray(
-            extr.get("rotation_matrix", np.eye(3)),
-            dtype=np.float32,
-        ).reshape(3, 3)
-        matrix[:3, 3] = np.asarray(
-            extr.get("translation", np.zeros(3)),
-            dtype=np.float32,
-        ).reshape(3)
+        matrix[:3, :3] = rotation.reshape(3, 3)
+        matrix[:3, 3] = translation.reshape(3)
         return matrix
 
     @staticmethod
     def current_cartesian_position(robot_state: dict[str, Any]) -> np.ndarray:
-        position = _coerce_vector(robot_state.get("eef_position"), 3)
-        rotation = _coerce_vector(robot_state.get("eef_rotation_rpy"), 3)
+        position = _coerce_vector(robot_state.get("eef_position"), 3, name="eef_position")
+        rotation = _coerce_vector(robot_state.get("eef_rotation_rpy"), 3, name="eef_rotation_rpy")
         return np.concatenate([position, rotation], axis=0).astype(np.float32)
 
     @staticmethod
     def current_gripper_position(robot_state: dict[str, Any]) -> np.ndarray:
-        return _coerce_vector(robot_state.get("eef_joint_position"), 1)
+        return _coerce_vector(robot_state.get("eef_joint_position"), 1, name="eef_joint_position")
 
     def current_joint_position(self, robot_state: dict[str, Any]) -> np.ndarray:
-        arm = _coerce_vector(robot_state.get("arm_joint_position"), self.arm_joint_dim)
-        eef = _coerce_vector(robot_state.get("eef_joint_position"), self.eef_joint_dim)
+        arm = _coerce_vector(robot_state.get("arm_joint_position"), self.arm_joint_dim, name="arm_joint_position")
+        eef = _coerce_vector(robot_state.get("eef_joint_position"), self.eef_joint_dim, name="eef_joint_position")
         return np.concatenate([arm, eef], axis=0).astype(np.float32)

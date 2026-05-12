@@ -142,26 +142,26 @@ class EpisodeRecorder:
         tiles: list[np.ndarray] = []
         tile_hw: tuple[int, int] | None = None
         for camera_name in self.camera_names:
-            camera = sim_frame.cameras.get(camera_name, {})
-            rgb = self._coerce_rgb(camera.get("rgb"))
+            camera = sim_frame.cameras.get(camera_name)
+            if camera is None:
+                raise RuntimeError(f"Missing camera '{camera_name}' in recorded SimFrame.")
+            rgb = self._coerce_rgb(camera.get("rgb"), camera_name=camera_name)
             if tile_hw is None:
                 tile_hw = rgb.shape[:2]
             else:
                 rgb = self._resize_rgb(rgb, tile_hw)
             tiles.append(self._annotate_rgb(rgb, camera_name))
         if not tiles:
-            return np.zeros((480, 640, 3), dtype=np.uint8)
+            raise RuntimeError("EpisodeRecorder has no cameras to compose.")
         return np.concatenate(tiles, axis=1)
 
     @staticmethod
-    def _coerce_rgb(value: Any) -> np.ndarray:
+    def _coerce_rgb(value: Any, *, camera_name: str) -> np.ndarray:
         if value is None:
-            return np.zeros((480, 640, 3), dtype=np.uint8)
+            raise RuntimeError(f"Missing RGB frame for camera '{camera_name}'.")
         rgb = np.asarray(value, dtype=np.uint8)
-        if rgb.ndim == 2:
-            rgb = np.repeat(rgb[..., None], 3, axis=2)
-        if rgb.shape[-1] > 3:
-            rgb = rgb[..., :3]
+        if rgb.ndim != 3 or rgb.shape[-1] != 3:
+            raise RuntimeError(f"Camera '{camera_name}' expected RGB shape [H,W,3], got {rgb.shape}.")
         return rgb
 
     @staticmethod

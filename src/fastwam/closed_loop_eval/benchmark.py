@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from omegaconf import OmegaConf
 
 from .episode_recorder import to_jsonable
 from .model_clients import BaseModelClient, FastWAMModelClient, HoldModelClient, ParallelFastWAMModelClient
@@ -33,6 +34,7 @@ from .sim_service_client import DEFAULT_AAO_ROOT, SimulatorServiceClient
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+_DEFAULT_PROFILE_DIR = _REPO_ROOT / "configs" / "aao_benchmark"
 
 
 @dataclass(frozen=True)
@@ -50,33 +52,9 @@ class BenchmarkProfile:
     text_cache_dir: str | None = None
 
 
-PROFILES: dict[str, BenchmarkProfile] = {
-    "open_door_airbot_play_gs": BenchmarkProfile(
-        name="open_door_airbot_play_gs",
-        task="open_door_airbot_play_gs",
-        instruction="open the door",
-        camera_map="head_left=env2_cam,right_wrist_left=eef_wrist_cam",
-        action_repeat=5,
-        train_action_hz=20.0,
-        max_updates=160,
-        proprio_mode="cartesian",
-        proprio_dim=7,
-        fastwam_config=str(_REPO_ROOT / "configs/task/mix_uncond_2cam224_1e-4.yaml"),
-        text_cache_dir="data/text_embeds_cache/mix",
-    ),
-    "cup_on_coaster_gs_airbot_p7": BenchmarkProfile(
-        name="cup_on_coaster_gs_airbot_p7",
-        task="cup_on_coaster_gs_airbot_p7",
-        instruction="pick up the cup and place it on the coaster",
-        camera_map="head_left=env1_cam,right_wrist_left=eef_wrist_cam",
-        action_repeat=1,
-        train_action_hz=50.0,
-        max_updates=650,
-        proprio_mode="joint",
-        proprio_dim=8,
-        fastwam_config=str(_REPO_ROOT / "configs/task/cup_uncond_2cam224_1e-4.yaml"),
-        text_cache_dir="data/text_embeds_cache/cup",
-    ),
+DEFAULT_PROFILE_FILES: dict[str, Path] = {
+    "open_door_airbot_play_gs": _DEFAULT_PROFILE_DIR / "open_door_airbot_play_gs.yaml",
+    "cup_on_coaster_gs_airbot_p7": _DEFAULT_PROFILE_DIR / "cup_on_coaster_gs_airbot_p7.yaml",
 }
 
 
@@ -88,7 +66,72 @@ DEFAULT_SENSOR_OVERRIDES = (
 
 
 def _profile_names() -> tuple[str, ...]:
-    return tuple(sorted(PROFILES))
+    return tuple(sorted(DEFAULT_PROFILE_FILES))
+
+
+def _resolve_repo_path(value: str | None, *, base_dir: Path | None = None) -> str | None:
+    if value is None:
+        return None
+    path = Path(str(value)).expanduser()
+    if path.is_absolute():
+        return str(path)
+    if base_dir is not None:
+        candidate = (base_dir / path).resolve()
+        if candidate.exists():
+            return str(candidate)
+    return str((_REPO_ROOT / path).resolve())
+
+
+def _load_profile_yaml(path: str | Path) -> dict[str, Any]:
+    resolved = Path(path).expanduser()
+    if not resolved.is_absolute():
+        resolved = (_REPO_ROOT / resolved).resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"Benchmark profile config does not exist: {resolved}")
+    payload = OmegaConf.to_container(OmegaConf.load(resolved), resolve=True)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Benchmark profile config must be a mapping: {resolved}")
+    payload = dict(payload)
+    payload.setdefault("name", resolved.stem)
+    payload["fastwam_config"] = _resolve_repo_path(payload.get("fastwam_config"), base_dir=resolved.parent)
+    payload["text_cache_dir"] = _resolve_repo_path(payload.get("text_cache_dir"), base_dir=resolved.parent)
+    return payload
+
+
+def _profile_from_dict(payload: dict[str, Any], *, source: Path | str) -> BenchmarkProfile:
+    required = ("name", "task", "instruction", "camera_map", "action_repeat", "train_action_hz", "max_updates")
+    missing = [key for key in required if payload.get(key) is None]
+    if missing:
+        raise RuntimeError(f"Benchmark profile {source} is missing required field(s): {', '.join(missing)}")
+    proprio_mode = str(payload.get("proprio_mode", "cartesian"))
+    if proprio_mode not in {"cartesian", "joint"}:
+        raise RuntimeError(f"Benchmark profile {source} has unsupported proprio_mode={proprio_mode!r}.")
+    proprio_dim = payload.get("proprio_dim")
+    return BenchmarkProfile(
+        name=str(payload["name"]),
+        task=str(payload["task"]),
+        instruction=str(payload["instruction"]),
+        camera_map=str(payload["camera_map"]),
+        action_repeat=int(payload["action_repeat"]),
+        train_action_hz=float(payload["train_action_hz"]),
+        max_updates=int(payload["max_updates"]),
+        proprio_mode=proprio_mode,
+        proprio_dim=None if proprio_dim is None else int(proprio_dim),
+        fastwam_config=None if payload.get("fastwam_config") is None else str(payload["fastwam_config"]),
+        text_cache_dir=None if payload.get("text_cache_dir") is None else str(payload["text_cache_dir"]),
+    )
+
+
+def _load_profile_file(path: str | Path) -> BenchmarkProfile:
+    return _profile_from_dict(_load_profile_yaml(path), source=path)
+
+
+def _load_named_profile(name: str) -> BenchmarkProfile:
+    try:
+        path = DEFAULT_PROFILE_FILES[name]
+    except KeyError as exc:
+        raise ValueError(f"Unknown benchmark profile '{name}'. Expected one of {sorted(DEFAULT_PROFILE_FILES)}.") from exc
+    return _load_profile_file(path)
 
 
 def _parse_model_gpus(value: str | None) -> list[str]:
@@ -98,18 +141,18 @@ def _parse_model_gpus(value: str | None) -> list[str]:
 
 
 def _resolve_profile(args: argparse.Namespace) -> BenchmarkProfile:
-    profile = PROFILES[args.profile]
+    profile = _load_profile_file(args.profile_config) if args.profile_config is not None else _load_named_profile(args.profile)
     values = {
-        "task": args.task or profile.task,
-        "instruction": args.instruction or profile.instruction,
-        "camera_map": args.camera_map or profile.camera_map,
-        "action_repeat": int(args.action_repeat or profile.action_repeat),
-        "train_action_hz": float(args.train_action_hz or profile.train_action_hz),
-        "max_updates": int(args.max_updates or profile.max_updates),
-        "proprio_mode": args.proprio_mode or profile.proprio_mode,
+        "task": args.task if args.task is not None else profile.task,
+        "instruction": args.instruction if args.instruction is not None else profile.instruction,
+        "camera_map": args.camera_map if args.camera_map is not None else profile.camera_map,
+        "action_repeat": int(args.action_repeat if args.action_repeat is not None else profile.action_repeat),
+        "train_action_hz": float(args.train_action_hz if args.train_action_hz is not None else profile.train_action_hz),
+        "max_updates": int(args.max_updates if args.max_updates is not None else profile.max_updates),
+        "proprio_mode": args.proprio_mode if args.proprio_mode is not None else profile.proprio_mode,
         "proprio_dim": args.proprio_dim if args.proprio_dim is not None else profile.proprio_dim,
-        "fastwam_config": args.fastwam_config or profile.fastwam_config,
-        "text_cache_dir": args.text_cache_dir or profile.text_cache_dir,
+        "fastwam_config": args.fastwam_config if args.fastwam_config is not None else profile.fastwam_config,
+        "text_cache_dir": args.text_cache_dir if args.text_cache_dir is not None else profile.text_cache_dir,
     }
     return replace(profile, **values)
 
@@ -137,6 +180,11 @@ class EnvEpisodeState:
     first_done_update: int | None = None
     model_worker_indices: list[int] = field(default_factory=list)
     model_worker_gpus: list[str] = field(default_factory=list)
+    stage_index: int | None = None
+    stage_name: str | None = None
+    phase: str | None = None
+    phase_step: int | None = None
+    task_details: Any = None
 
 
 def _success_to_bool(value: Any) -> bool:
@@ -202,13 +250,15 @@ def _validate_model_client(profile: BenchmarkProfile, model_client: BaseModelCli
         )
 
 
-def _resize_vector(values: np.ndarray, dim: int | None) -> np.ndarray:
+def _require_vector_dim(values: np.ndarray, dim: int | None, *, name: str) -> np.ndarray:
     array = np.asarray(values, dtype=np.float32).reshape(-1)
     if dim is None:
+        if array.size == 0:
+            raise RuntimeError(f"{name} must not be empty.")
         return array
-    if array.size < dim:
-        array = np.pad(array, (0, int(dim) - array.size), constant_values=0.0)
-    return array[: int(dim)].astype(np.float32, copy=False)
+    if array.size != int(dim):
+        raise RuntimeError(f"{name} expected exactly {int(dim)} values, got {array.size}.")
+    return array.astype(np.float32, copy=False)
 
 
 def _prepare_model_input(
@@ -218,55 +268,106 @@ def _prepare_model_input(
     profile: BenchmarkProfile,
 ) -> dict[str, Any]:
     model_input = adapter.build_model_input(camera_map, proprio_mode=profile.proprio_mode)
-    model_input["proprio_raw"] = _resize_vector(model_input["proprio_raw"], profile.proprio_dim)
+    model_input["proprio_raw"] = _require_vector_dim(
+        model_input["proprio_raw"],
+        profile.proprio_dim,
+        name=f"profile '{profile.name}' proprio_raw",
+    )
     model_input["instruction"] = profile.instruction
     return model_input
 
 
-def _as_array(value: Any, *, dtype: Any, default: Any, batch_size: int) -> np.ndarray:
+def _required_array(value: Any, *, dtype: Any, name: str, batch_size: int) -> np.ndarray:
     if value is None:
-        return np.asarray([default] * batch_size, dtype=dtype)
+        raise RuntimeError(f"AAO task update is missing required field '{name}'.")
     array = np.asarray(value, dtype=dtype).reshape(-1)
-    if array.size == 0:
-        return np.asarray([default] * batch_size, dtype=dtype)
-    if array.size == 1 and batch_size > 1:
-        return np.repeat(array, batch_size)
     if array.size != batch_size:
-        out = np.asarray([default] * batch_size, dtype=dtype)
-        out[: min(batch_size, array.size)] = array[: min(batch_size, array.size)]
-        return out
+        raise RuntimeError(f"AAO task update field '{name}' expected {batch_size} values, got {array.size}.")
     return array
 
 
-def _status_array(value: Any, *, batch_size: int) -> list[str | None]:
+def _optional_items(value: Any, *, name: str, batch_size: int) -> list[Any]:
     if value is None:
         return [None] * batch_size
     if isinstance(value, np.ndarray):
         items = value.reshape(-1).tolist()
-    elif isinstance(value, list):
+    elif isinstance(value, (list, tuple)):
         items = value
     else:
         items = [value]
-    if len(items) == 1 and batch_size > 1:
-        items = items * batch_size
-    if len(items) < batch_size:
-        items = [*items, *([None] * (batch_size - len(items)))]
-    return [None if item is None else str(getattr(item, "value", item)) for item in items[:batch_size]]
+    if len(items) != batch_size:
+        raise RuntimeError(f"AAO task update field '{name}' expected {batch_size} values, got {len(items)}.")
+    return list(items)
 
 
-def _extract_update_arrays(update: Any, task_state: dict[str, Any], batch_size: int) -> tuple[np.ndarray, np.ndarray, list[str | None]]:
-    done_source = getattr(update, "done", None)
-    success_source = getattr(update, "success", None)
-    status_source = getattr(update, "status", None)
-    if done_source is None:
-        done_source = task_state.get("done")
-    if success_source is None:
-        success_source = task_state.get("success")
-    return (
-        _as_array(done_source, dtype=bool, default=False, batch_size=batch_size),
-        _as_array(success_source, dtype=object, default=False, batch_size=batch_size),
-        _status_array(status_source, batch_size=batch_size),
+def _optional_array(value: Any, *, dtype: Any, name: str, batch_size: int) -> np.ndarray | None:
+    if value is None:
+        return None
+    return _required_array(value, dtype=dtype, name=name, batch_size=batch_size)
+
+
+def _task_update_source(update: Any, task_state: dict[str, Any], name: str) -> Any:
+    value = getattr(update, name, None) if update is not None else None
+    if value is None:
+        value = task_state.get(name)
+    return value
+
+
+def _extract_task_update(
+    update: Any,
+    task_state: dict[str, Any],
+    batch_size: int,
+) -> dict[str, Any]:
+    status_items = _optional_items(
+        _task_update_source(update, task_state, "status"),
+        name="status",
+        batch_size=batch_size,
     )
+    stage_name_items = _optional_items(
+        _task_update_source(update, task_state, "stage_name"),
+        name="stage_name",
+        batch_size=batch_size,
+    )
+    details_items = _optional_items(
+        _task_update_source(update, task_state, "details"),
+        name="details",
+        batch_size=batch_size,
+    )
+    phase_items = _optional_items(
+        _task_update_source(update, task_state, "phase"),
+        name="phase",
+        batch_size=batch_size,
+    )
+    return {
+        "done": _required_array(
+            _task_update_source(update, task_state, "done"),
+            dtype=bool,
+            name="done",
+            batch_size=batch_size,
+        ),
+        "success": _required_array(
+            _task_update_source(update, task_state, "success"),
+            dtype=object,
+            name="success",
+            batch_size=batch_size,
+        ),
+        "status": [None if item is None else str(getattr(item, "value", item)) for item in status_items],
+        "stage_index": _optional_array(
+            _task_update_source(update, task_state, "stage_index"),
+            dtype=np.int64,
+            name="stage_index",
+            batch_size=batch_size,
+        ),
+        "stage_name": [None if item is None else str(item) for item in stage_name_items],
+        "details": details_items,
+        "phase": [None if item is None else str(item) for item in phase_items],
+        "phase_step": _optional_array(
+            _task_update_source(update, task_state, "phase_step"),
+            dtype=np.int64,
+            name="phase_step",
+            batch_size=batch_size,
+        ),
+    }
 
 
 def _row_for_episode(
@@ -285,6 +386,11 @@ def _row_for_episode(
         "done": bool(state.done),
         "finished": bool(state.finished),
         "status": state.status,
+        "stage_index": state.stage_index,
+        "stage_name": state.stage_name,
+        "phase": state.phase,
+        "phase_step": state.phase_step,
+        "task_details": state.task_details,
         "updates_used": int(state.updates_used),
         "model_steps_used": int(state.model_steps_used),
         "first_done_update": state.first_done_update,
@@ -312,6 +418,11 @@ def _write_rows_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "done",
         "finished",
         "status",
+        "stage_index",
+        "stage_name",
+        "phase",
+        "phase_step",
+        "task_details",
         "updates_used",
         "model_steps_used",
         "first_done_update",
@@ -331,7 +442,24 @@ def _write_rows_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(fp, fieldnames=fields)
         writer.writeheader()
         for row in rows:
-            writer.writerow({field: row.get(field) for field in fields})
+            writer.writerow({field: _csv_value(row.get(field)) for field in fields})
+
+
+def _csv_value(value: Any) -> Any:
+    if isinstance(value, (dict, list, tuple, np.ndarray, np.generic)):
+        return json.dumps(to_jsonable(value), ensure_ascii=False, sort_keys=True)
+    return value
+
+
+def _append_row_jsonl(path: Path, row: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(to_jsonable(row), ensure_ascii=False) + "\n")
+
+
+def _persist_rows(output_root: Path, rows: list[dict[str, Any]], row: dict[str, Any] | None = None) -> None:
+    if row is not None:
+        _append_row_jsonl(output_root / "benchmark_results.jsonl", row)
+    _write_rows_csv(output_root / "benchmark_results.csv", rows)
 
 
 def _write_summary(
@@ -384,6 +512,11 @@ def _start_episode(
     env_state.first_done_update = None
     env_state.model_worker_indices = []
     env_state.model_worker_gpus = []
+    env_state.stage_index = None
+    env_state.stage_name = None
+    env_state.phase = None
+    env_state.phase_step = None
+    env_state.task_details = None
 
 
 def _complete_episode(
@@ -393,6 +526,7 @@ def _complete_episode(
     profile: BenchmarkProfile,
     args: argparse.Namespace,
     error: str | None = None,
+    output_root: Path | None = None,
 ) -> None:
     if state.finished:
         return
@@ -400,7 +534,10 @@ def _complete_episode(
         state.error = error
     state.finished = True
     state.end_perf = time.perf_counter()
-    rows.append(_row_for_episode(state=state, profile=profile, args=args))
+    row = _row_for_episode(state=state, profile=profile, args=args)
+    rows.append(row)
+    if output_root is not None:
+        _persist_rows(output_root, rows, row=row)
     state.episode_index = None
 
 
@@ -410,6 +547,11 @@ def _record_task_update(
     done: bool,
     success: Any,
     status: str | None,
+    stage_index: int | None,
+    stage_name: str | None,
+    phase: str | None,
+    phase_step: int | None,
+    details: Any,
 ) -> None:
     if done:
         state.done = True
@@ -421,6 +563,11 @@ def _record_task_update(
         state.success = success
     if status is not None:
         state.status = status
+    state.stage_index = stage_index
+    state.stage_name = stage_name
+    state.phase = phase
+    state.phase_step = phase_step
+    state.task_details = to_jsonable(details)
 
 
 def _assign_new_episodes(
@@ -434,6 +581,7 @@ def _assign_new_episodes(
     total_episodes: int,
     rows: list[dict[str, Any]],
     args: argparse.Namespace,
+    output_root: Path,
 ) -> int:
     for state in env_states:
         if state.episode_index is not None or next_episode_index >= total_episodes:
@@ -452,8 +600,37 @@ def _assign_new_episodes(
         except Exception as exc:  # noqa: BLE001
             error = "".join(traceback.format_exception_only(type(exc), exc)).strip()
             state.episode_index = next_episode_index
+            state.updates_used = 0
+            state.model_steps_used = 0
+            state.chunk_index = 0
+            state.chunk_action_index = 0
+            state.chunk_actions = None
+            state.last_action = None
             state.start_perf = time.perf_counter()
-            _complete_episode(state=state, rows=rows, profile=profile, args=args, error=error)
+            state.end_perf = None
+            state.done = False
+            state.success = False
+            state.status = None
+            state.error = None
+            state.model_infer_calls = 0
+            state.model_infer_time_sec = 0.0
+            state.sim_update_time_sec = 0.0
+            state.first_done_update = None
+            state.model_worker_indices = []
+            state.model_worker_gpus = []
+            state.stage_index = None
+            state.stage_name = None
+            state.phase = None
+            state.phase_step = None
+            state.task_details = None
+            _complete_episode(
+                state=state,
+                rows=rows,
+                profile=profile,
+                args=args,
+                error=error,
+                output_root=output_root,
+            )
             logger.exception("Failed to start benchmark episode env=%s episode=%s", state.env_index, next_episode_index)
             next_episode_index += 1
     return next_episode_index
@@ -473,6 +650,7 @@ def _ensure_actions_for_states(
     args: argparse.Namespace,
     action_dim: int | None,
     rows: list[dict[str, Any]],
+    output_root: Path,
 ) -> None:
     needs_actions = [
         state
@@ -520,7 +698,14 @@ def _ensure_actions_for_states(
                 state.model_worker_gpus.append(str(model_gpu))
         except Exception as exc:  # noqa: BLE001
             error = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-            _complete_episode(state=state, rows=rows, profile=profile, args=args, error=error)
+            _complete_episode(
+                state=state,
+                rows=rows,
+                profile=profile,
+                args=args,
+                error=error,
+                output_root=output_root,
+            )
             logger.exception("Model action validation failed env=%s episode=%s", state.env_index, state.episode_index)
 
 
@@ -536,8 +721,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--action-horizon must be positive.")
     if args.action_format != "cartesian_absolute":
         raise ValueError("Benchmark mode currently expects cartesian_absolute AAO actions.")
+    if args.sim_loop_frequency < 0:
+        raise ValueError("--sim-loop-frequency must be non-negative.")
+    if args.sim_loop_frequency > 0:
+        raise ValueError(
+            "Batch AAO benchmark currently supports lockstep mode only. "
+            "Use --sim-loop-frequency 0 so update counts and per-env episode accounting stay exact."
+        )
+    if args.model_worker_timeout_sec <= 0:
+        raise ValueError("--model-worker-timeout-sec must be positive.")
 
     profile = _resolve_profile(args)
+    if profile.action_repeat <= 0:
+        raise ValueError("--action-repeat/profile.action_repeat must be positive.")
+    if profile.max_updates <= 0:
+        raise ValueError("--max-updates/profile.max_updates must be positive.")
+    if profile.train_action_hz <= 0:
+        raise ValueError("--train-action-hz/profile.train_action_hz must be positive.")
     args.task = profile.task
     args.instruction = profile.instruction
     args.camera_map = profile.camera_map
@@ -550,6 +750,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     args.text_cache_dir = profile.text_cache_dir
     output_root = Path(args.output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
+    for stale_name in ("benchmark_results.jsonl", "benchmark_results.csv", "benchmark_summary.json"):
+        stale_path = output_root / stale_name
+        if stale_path.exists():
+            stale_path.unlink()
 
     overrides = [*args.override]
     if not any(item.startswith("env.batch_size=") for item in overrides):
@@ -600,6 +804,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             total_episodes=args.total_episodes,
             rows=rows,
             args=args,
+            output_root=output_root,
         )
 
         while next_episode_index < args.total_episodes or _active_states(env_states):
@@ -615,6 +820,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     total_episodes=args.total_episodes,
                     rows=rows,
                     args=args,
+                    output_root=output_root,
                 )
                 continue
             _ensure_actions_for_states(
@@ -626,6 +832,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 args=args,
                 action_dim=action_dim,
                 rows=rows,
+                output_root=output_root,
             )
             active = _active_states(env_states)
             if not active:
@@ -635,7 +842,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for state in active:
                 if state.updates_used >= profile.max_updates:
                     state.status = state.status or "max_updates"
-                    _complete_episode(state=state, rows=rows, profile=profile, args=args)
+                    _complete_episode(
+                        state=state,
+                        rows=rows,
+                        profile=profile,
+                        args=args,
+                        output_root=output_root,
+                    )
                     continue
                 if state.chunk_actions is None or state.chunk_action_index >= len(state.chunk_actions):
                     continue
@@ -656,6 +869,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     total_episodes=args.total_episodes,
                     rows=rows,
                     args=args,
+                    output_root=output_root,
                 )
                 continue
 
@@ -678,18 +892,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     state.sim_update_time_sec += sim_elapsed / max(len(current_states), 1)
                     adapters[state.env_index].extend([observations[state.env_index]])
                 task_state = sim.get_task_state()
-                done_arr, success_arr, status_arr = _extract_update_arrays(update, task_state, sim.batch_size)
+                task_update = _extract_task_update(update, task_state, sim.batch_size)
                 for state in list(current_states):
-                    done = bool(done_arr[state.env_index])
-                    success = success_arr[state.env_index]
-                    status = status_arr[state.env_index]
-                    _record_task_update(state=state, done=done, success=success, status=status)
+                    env_index = state.env_index
+                    done = bool(task_update["done"][env_index])
+                    success = task_update["success"][env_index]
+                    status = task_update["status"][env_index]
+                    stage_index_array = task_update["stage_index"]
+                    phase_step_array = task_update["phase_step"]
+                    _record_task_update(
+                        state=state,
+                        done=done,
+                        success=success,
+                        status=status,
+                        stage_index=None if stage_index_array is None else int(stage_index_array[env_index]),
+                        stage_name=task_update["stage_name"][env_index],
+                        phase=task_update["phase"][env_index],
+                        phase_step=None if phase_step_array is None else int(phase_step_array[env_index]),
+                        details=task_update["details"][env_index],
+                    )
                     if (done and not args.ignore_done) or state.updates_used >= profile.max_updates:
                         if done or _success_to_bool(success):
                             state.success = success
                         if state.updates_used >= profile.max_updates and not state.done:
                             state.status = "max_updates"
-                        _complete_episode(state=state, rows=rows, profile=profile, args=args)
+                        _complete_episode(
+                            state=state,
+                            rows=rows,
+                            profile=profile,
+                            args=args,
+                            output_root=output_root,
+                        )
                         stepping_states.remove(state)
                 if not stepping_states:
                     break
@@ -704,6 +937,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 total_episodes=args.total_episodes,
                 rows=rows,
                 args=args,
+                output_root=output_root,
             )
 
         payload = _build_payload(
@@ -720,6 +954,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         _write_summary(output_root=output_root, payload=payload, rows=rows)
         return payload
+    except Exception as exc:
+        if rows:
+            partial_payload = _build_payload(
+                args=args,
+                profile=profile,
+                model_client=model_client,
+                output_root=output_root,
+                rows=rows,
+                sim_info=sim_info,
+                camera_map=camera_map,
+                selected_cameras=selected_cameras,
+                overrides=overrides,
+                wall_start=wall_start,
+            )
+            partial_payload["incomplete"] = True
+            partial_payload["run_error"] = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+            _write_summary(output_root=output_root, payload=partial_payload, rows=rows)
+        raise
     finally:
         if model_client is not None:
             model_client.close()
@@ -753,6 +1005,7 @@ def _build_payload(
         "success_rate": None if completed == 0 else successes / completed,
         "elapsed_time_sec": elapsed,
         "episodes_per_sec": None if elapsed <= 0 else completed / elapsed,
+        "incomplete": False,
         "model_client": args.model_client,
         "model_gpus": _parse_model_gpus(args.model_gpus),
         "model_worker_start_method": args.model_worker_start_method,
@@ -768,6 +1021,7 @@ def _build_payload(
         "control": _control_metadata(args, sim_info=sim_info, stride=args.stride),
         "control_mode": _resolve_control_mode(args),
         "results_csv": str(output_root / "benchmark_results.csv"),
+        "results_jsonl": str(output_root / "benchmark_results.jsonl"),
         "summary_json": str(output_root / "benchmark_summary.json"),
         "episodes": rows,
     }
@@ -777,6 +1031,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aao-root", default=str(DEFAULT_AAO_ROOT))
     parser.add_argument("--profile", choices=_profile_names(), default="open_door_airbot_play_gs")
+    parser.add_argument(
+        "--profile-config",
+        default=None,
+        help="Path to a benchmark profile YAML. Overrides --profile when provided.",
+    )
     parser.add_argument("--task", default=None)
     parser.add_argument("--override", action="append", default=[])
     parser.add_argument("--output-dir", default="runs/aao_benchmark")
@@ -828,6 +1087,7 @@ def main(argv: list[str] | None = None) -> None:
         "success_rate": result["success_rate"],
         "summary_json": result["summary_json"],
         "results_csv": result["results_csv"],
+        "results_jsonl": result["results_jsonl"],
     }
     print(json.dumps(to_jsonable(compact), indent=2))
 

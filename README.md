@@ -17,7 +17,7 @@ This repository contains the training and evaluation code for FastWAM on LIBERO 
 
 This workspace also contains a local integration of FastWAM with
 `auto-atomic-operation` (AAO) for closed-loop simulator validation. The current
-bridge supports the GS open-door Airbot Play setup and the non-GS P7 cup task.
+bridge supports the GS open-door Airbot Play setup and the P7 cup-on-coaster task.
 The integration is intentionally kept separate from the training pipeline:
 
 - AAO is vendored as `third_party/auto-atomic-operation` and pinned to the
@@ -33,6 +33,8 @@ The integration is intentionally kept separate from the training pipeline:
   `scripts/run_aao_visual_rollout.py`.
 - Batch benchmark entrypoint:
   `scripts/run_aao_benchmark.py`; see `docs/aao_benchmark.md`.
+- Batch benchmark smoke entrypoint:
+  `scripts/run_aao_benchmark_smoke_tests.py`.
 
 The default open-door task is `open_door_airbot_play_gs`. The current bridge
 uses the mix 20k checkpoint by default:
@@ -71,17 +73,21 @@ settings are:
   --sim-loop-frequency 0
 ```
 
-The batch benchmark mode currently supports `open_door_airbot_play_gs` and
-`cup_on_coaster_gs_airbot_p7`. Both profiles use 7D EEF pose + gripper model
-actions and send `cartesian_absolute` commands to AAO. The cup profile uses 8D
-joint + gripper proprio as model input, but it does not use the AAO P7 v3 UMI
-operator or `joint_absolute` control. For multi-env and multi-model-GPU
-benchmark usage, see `docs/aao_benchmark.md`.
+Batch benchmark profiles live in `configs/aao_benchmark/`. The current presets
+are `open_door_airbot_play_gs` and `cup_on_coaster_gs_airbot_p7`; new test envs
+can be supplied with `--profile-config <yaml>`. Both preset profiles use 7D EEF
+pose + gripper model actions and send `cartesian_absolute` commands to AAO. The
+cup profile uses 8D joint + gripper proprio as model input, but it does not use
+`joint_absolute` control. Batch benchmark currently supports lockstep only,
+that is `--sim-loop-frequency 0`. For multi-env and multi-model-GPU benchmark
+usage, see `docs/aao_benchmark.md`.
 
-Important caveat: AAO `final_success` alone is not a reliable open-door
-criterion for the current setup. Always inspect `multicam.mp4` and the
-MuJoCo diagnostics in `client_trace.json.gz` / `aggregate_summary.json`,
-especially `door_hinge` and `handle_hinge` deltas.
+Important caveat: AAO `success_rate` / `final_success` alone is not a reliable
+open-door criterion for the current setup. Batch benchmark records `stage_name`,
+`phase`, and `task_details` in `benchmark_results.csv` /
+`benchmark_results.jsonl`; use those fields to interpret failures and success
+semantics. For visual inspection, use the single-episode runner or visual
+rollout.
 
 For visual debugging of the model's imagined future against VAE reconstruction
 and actual AAO observations, use the visual rollout script. `--frame-sampling

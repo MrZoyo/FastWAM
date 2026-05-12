@@ -266,14 +266,14 @@ class FastWAMModelClient(BaseModelClient):
         ]
 
     def _resolve_current_position(self, model_input: dict[str, Any]) -> np.ndarray:
-        for key in ("current_position", "cartesian_position", "joint_position"):
+        for key in ("current_position", "cartesian_position"):
             if key in model_input and model_input[key] is not None:
                 current = np.asarray(model_input[key], dtype=np.float32).reshape(-1)
                 break
         else:
-            current = np.asarray(model_input["proprio_raw"], dtype=np.float32).reshape(-1)[:6]
-        if current.size < 6:
-            raise RuntimeError(f"Current position must contain at least 6 values, got {current.size}.")
+            raise RuntimeError("Model input is missing current/cartesian_position required for delta6_abs_gripper actions.")
+        if current.size != 6:
+            raise RuntimeError(f"Current cartesian position must contain exactly 6 values, got {current.size}.")
         return current
 
     def infer_joint_video(
@@ -345,6 +345,8 @@ class FastWAMModelClient(BaseModelClient):
                 raise RuntimeError(f"Missing FastWAM camera '{camera_key}' in model input.")
             _, height, width = self.image_shapes[camera_key]
             rgb = np.asarray(images[camera_key], dtype=np.uint8)
+            if rgb.ndim != 3 or rgb.shape[-1] != 3:
+                raise RuntimeError(f"FastWAM camera '{camera_key}' expected RGB shape [H,W,3], got {rgb.shape}.")
             resized = Image.fromarray(rgb).resize((width, height), Image.BILINEAR)
             arr = np.asarray(resized, dtype=np.float32)
             tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous()

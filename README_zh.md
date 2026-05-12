@@ -16,7 +16,7 @@
 ## AAO 闭环仿真集成
 
 当前工作区额外集成了 `auto-atomic-operation`（AAO），用于闭环仿真验证。
-目前桥接代码支持 GS 版本 open door Airbot Play 场景，以及非 GS 的 P7 cup
+目前桥接代码支持 GS 版本 open door Airbot Play 场景，以及 P7 cup-on-coaster
 场景。这部分和训练主流程解耦：
 
 - AAO 以 submodule 形式放在 `third_party/auto-atomic-operation`，当前 pin
@@ -29,6 +29,7 @@
   `scripts/run_aao_visual_rollout.py`。
 - batch benchmark 入口：`scripts/run_aao_benchmark.py`，详细用法见
   `docs/aao_benchmark.md`。
+- batch benchmark smoke 入口：`scripts/run_aao_benchmark_smoke_tests.py`。
 
 默认任务是 `open_door_airbot_play_gs`。当前闭环代码默认使用 mix 20k
 权重：
@@ -66,16 +67,18 @@ embedding cache 和 checkpoint；如果使用别的 run，用 `--fastwam-config`
   --sim-loop-frequency 0
 ```
 
-batch benchmark 当前支持 `open_door_airbot_play_gs` 和
-`cup_on_coaster_gs_airbot_p7`。两个 profile 的模型输出都按 7D EEF pose +
-gripper 处理，并统一向 AAO 下发 `cartesian_absolute`。cup profile 的模型输入
-state 是 8D joint + gripper，但不使用 AAO P7 v3 UMI operator，也不走
-`joint_absolute` 控制。多 env、多模型 GPU 的 benchmark 用法见
-`docs/aao_benchmark.md`。
+batch benchmark 的 profile 配置在 `configs/aao_benchmark/`，当前预设
+`open_door_airbot_play_gs` 和 `cup_on_coaster_gs_airbot_p7`。也可以通过
+`--profile-config <yaml>` 接入新的测试 env。两个预设 profile 的模型输出都按
+7D EEF pose + gripper 处理，并统一向 AAO 下发 `cartesian_absolute`；cup
+profile 的模型输入 state 是 8D joint + gripper，但不走 `joint_absolute`
+控制。batch benchmark 当前只支持 lockstep，即 `--sim-loop-frequency 0`。
+多 env、多模型 GPU 的 benchmark 用法见 `docs/aao_benchmark.md`。
 
-注意：当前 AAO `final_success` 不能单独作为真实开门成功标准。需要同时
-检查 `multicam.mp4` 和 `client_trace.json.gz` / `aggregate_summary.json`
-里的 MuJoCo 诊断，尤其是 `door_hinge` 和 `handle_hinge` 的位移。
+注意：当前 AAO `success_rate` / `final_success` 不能单独作为真实开门成功标准。
+batch benchmark 会在 `benchmark_results.csv` / `benchmark_results.jsonl` 中记录
+`stage_name`、`phase` 和 `task_details`，需要结合这些字段判断失败原因和
+success 语义。需要视觉排查时，再用单 episode runner 或 visual rollout。
 
 需要对比模型想象视频、VAE recon 和 AAO 实际观测时，可以使用 visual
 rollout 脚本。`--frame-sampling sim-update` 会按每个 AAO update 输出一帧；

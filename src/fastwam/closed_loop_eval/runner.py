@@ -62,14 +62,17 @@ def _validated_actions(
         raise RuntimeError(f"Model actions must have shape [T,D], got {actions.shape}.")
     if expected_format == "cartesian_absolute":
         action_dim = 7 if action_dim is None else int(action_dim)
-        min_dim = 7
     elif expected_format == "joint_absolute":
-        min_dim = 1 if action_dim is None else int(action_dim)
+        if action_dim is None:
+            if actions.shape[1] < 1:
+                raise RuntimeError(f"Model actions must have shape [T,D] with D >= 1, got {actions.shape}.")
+            return actions
+        action_dim = int(action_dim)
     else:
         raise RuntimeError(f"Unsupported expected action format: {expected_format}")
-    if actions.shape[1] < min_dim:
-        raise RuntimeError(f"Model actions must have shape [T,{min_dim}+], got {actions.shape}.")
-    return actions[:, :action_dim] if action_dim is not None else actions
+    if actions.shape[1] != action_dim:
+        raise RuntimeError(f"Model actions must have shape [T,{action_dim}], got {actions.shape}.")
+    return actions
 
 
 def _clamp_gripper(

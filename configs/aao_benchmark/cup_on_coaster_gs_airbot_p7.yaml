@@ -1,0 +1,11 @@
+name: cup_on_coaster_gs_airbot_p7
+task: cup_on_coaster_gs_airbot_p7
+instruction: pick up the cup and place it on the coaster
+camera_map: head_left=env1_cam,right_wrist_left=eef_wrist_cam
+action_repeat: 1
+train_action_hz: 50.0
+max_updates: 650
+proprio_mode: joint
+proprio_dim: 8
+fastwam_config: configs/task/cup_uncond_2cam224_1e-4.yaml
+text_cache_dir: data/text_embeds_cache/cup
