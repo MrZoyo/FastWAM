@@ -152,8 +152,8 @@ class SimulatorServiceClient:
             "info": self.info,
         }
 
-    def reset(self) -> Any:
-        return self._require_evaluator().reset()
+    def reset(self, env_mask: np.ndarray | None = None) -> Any:
+        return self._require_evaluator().reset(env_mask=env_mask)
 
     def get_observation(self) -> dict[str, dict[str, Any]]:
         observation = self._require_evaluator().get_observation()

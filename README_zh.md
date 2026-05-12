@@ -27,6 +27,8 @@
 - 多门/多背景 sweep 入口：`scripts/run_aao_open_door_gs_sweep.py`。
 - pred / VAE recon / 实际仿真对比视频入口：
   `scripts/run_aao_visual_rollout.py`。
+- batch benchmark 入口：`scripts/run_aao_benchmark.py`，详细用法见
+  `docs/aao_benchmark.md`。
 
 默认任务是 `open_door_airbot_play_gs`。当前闭环代码默认使用 mix 20k
 权重：
@@ -64,29 +66,12 @@ embedding cache 和 checkpoint；如果使用别的 run，用 `--fastwam-config`
   --sim-loop-frequency 0
 ```
 
-上游 P7 cup UMI 任务已经从 `cup_on_coaster_gs_airbot_p7_umi` 重命名为
-`cup_on_coaster_airbot_p7_umi`。虽然 AAO 配置里 MuJoCo model 名仍是
-`demo_gs.xml`，这个任务没有启用 GS renderer；它是非 GS MuJoCo 场景，
-动作是 7 个 P7 关节加 1 个 UMI 夹爪距离命令。这个环境需要使用
-`joint_absolute` action 和 joint proprio：
-
-```bash
-.venv/bin/python -B scripts/run_aao_closed_loop_eval.py \
-  --task cup_on_coaster_airbot_p7_umi \
-  --model-client hold-joint \
-  --action-format joint_absolute \
-  --proprio-mode joint \
-  --camera-map head_left=env1_cam,right_wrist_left=eef_wrist_cam \
-  --episodes 1 \
-  --max-updates 2 \
-  --stride 1 \
-  --action-repeat 1 \
-  --no-video
-```
-
-后续用新训练的 P7 joint 模型评测时，仿真参数保持上面这套，模型侧改成
-直接输出绝对 joint action，例如：
-`--model-client fastwam --model-action-mode absolute_joint --output-action-format joint_absolute`。
+batch benchmark 当前支持 `open_door_airbot_play_gs` 和
+`cup_on_coaster_gs_airbot_p7`。两个 profile 的模型输出都按 7D EEF pose +
+gripper 处理，并统一向 AAO 下发 `cartesian_absolute`。cup profile 的模型输入
+state 是 8D joint + gripper，但不使用 AAO P7 v3 UMI operator，也不走
+`joint_absolute` 控制。多 env、多模型 GPU 的 benchmark 用法见
+`docs/aao_benchmark.md`。
 
 注意：当前 AAO `final_success` 不能单独作为真实开门成功标准。需要同时
 检查 `multicam.mp4` 和 `client_trace.json.gz` / `aggregate_summary.json`

@@ -31,6 +31,8 @@ The integration is intentionally kept separate from the training pipeline:
   `scripts/run_aao_open_door_gs_sweep.py`.
 - Pred/VAE-recon/actual simulator comparison video entrypoint:
   `scripts/run_aao_visual_rollout.py`.
+- Batch benchmark entrypoint:
+  `scripts/run_aao_benchmark.py`; see `docs/aao_benchmark.md`.
 
 The default open-door task is `open_door_airbot_play_gs`. The current bridge
 uses the mix 20k checkpoint by default:
@@ -69,30 +71,12 @@ settings are:
   --sim-loop-frequency 0
 ```
 
-The upstream P7 cup UMI task was renamed from
-`cup_on_coaster_gs_airbot_p7_umi` to `cup_on_coaster_airbot_p7_umi`. Despite
-the `demo_gs.xml` MuJoCo model name inside AAO, this task does not enable the
-GS renderer; it is a non-GS MuJoCo scene with 7 P7 arm joints plus one UMI
-gripper distance command. Use `joint_absolute` actions and joint proprio for
-that environment:
-
-```bash
-.venv/bin/python -B scripts/run_aao_closed_loop_eval.py \
-  --task cup_on_coaster_airbot_p7_umi \
-  --model-client hold-joint \
-  --action-format joint_absolute \
-  --proprio-mode joint \
-  --camera-map head_left=env1_cam,right_wrist_left=eef_wrist_cam \
-  --episodes 1 \
-  --max-updates 2 \
-  --stride 1 \
-  --action-repeat 1 \
-  --no-video
-```
-
-When evaluating a newly trained P7 joint model, keep the simulator flags above
-and switch the model side to direct absolute joint output, for example:
-`--model-client fastwam --model-action-mode absolute_joint --output-action-format joint_absolute`.
+The batch benchmark mode currently supports `open_door_airbot_play_gs` and
+`cup_on_coaster_gs_airbot_p7`. Both profiles use 7D EEF pose + gripper model
+actions and send `cartesian_absolute` commands to AAO. The cup profile uses 8D
+joint + gripper proprio as model input, but it does not use the AAO P7 v3 UMI
+operator or `joint_absolute` control. For multi-env and multi-model-GPU
+benchmark usage, see `docs/aao_benchmark.md`.
 
 Important caveat: AAO `final_success` alone is not a reliable open-door
 criterion for the current setup. Always inspect `multicam.mp4` and the

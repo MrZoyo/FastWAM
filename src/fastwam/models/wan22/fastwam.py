@@ -254,14 +254,17 @@ class FastWAM(torch.nn.Module):
     def _encode_input_image_latents_tensor(self, input_image: torch.Tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+        if input_image.ndim != 4 or input_image.shape[1] != 3:
             raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                f"`input_image` must have shape [B,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
             )
-        image = input_image.to(device=self.device)[0].unsqueeze(1)
-        z = self.vae.encode([image], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        images = [
+            image.unsqueeze(1)
+            for image in input_image.to(device=self.device)
+        ]
+        z = self.vae.encode(images, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         if isinstance(z, list):
-            z = z[0].unsqueeze(0)
+            z = torch.stack(z)
         return z
 
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
@@ -927,11 +930,11 @@ class FastWAM(torch.nn.Module):
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+        if input_image.ndim != 4 or input_image.shape[1] != 3:
             raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                f"`input_image` must have shape [B,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
             )
-        _, _, height, width = input_image.shape
+        batch_size, _, height, width = input_image.shape
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(
                 f"`input_image` must be resized before infer, expected multiples of 16 but got HxW=({height},{width})"
@@ -941,17 +944,17 @@ class FastWAM(torch.nn.Module):
                 raise ValueError("`proprio` was provided but `proprio_dim=None` so `proprio_encoder` is disabled.")
             if proprio.ndim == 1:
                 proprio = proprio.unsqueeze(0)
-            elif proprio.ndim == 2 and proprio.shape[0] == 1:
+            elif proprio.ndim == 2 and proprio.shape[0] == batch_size:
                 pass
             else:
-                raise ValueError(f"`proprio` must be [D] or [1,D], got shape {tuple(proprio.shape)}")
+                raise ValueError(f"`proprio` must be [D] or [B,D], got shape {tuple(proprio.shape)}")
             if proprio.shape[1] != self.proprio_dim:
                 raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
 
         generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
         latents_action = torch.randn(
-            (1, action_horizon, self.action_expert.action_dim),
+            (batch_size, action_horizon, self.action_expert.action_dim),
             generator=generator,
             device=rand_device,
             dtype=torch.float32,
@@ -980,6 +983,14 @@ class FastWAM(torch.nn.Module):
             if context.ndim != 3 or context_mask.ndim != 2:
                 raise ValueError(
                     f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
+                )
+            if context.shape[0] == 1 and batch_size > 1:
+                context = context.repeat(batch_size, 1, 1)
+                context_mask = context_mask.repeat(batch_size, 1)
+            if context.shape[0] != batch_size or context_mask.shape[0] != batch_size:
+                raise ValueError(
+                    "`context/context_mask` batch size must be 1 or match input image batch size, "
+                    f"got context={context.shape[0]}, mask={context_mask.shape[0]}, images={batch_size}."
                 )
             context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
             context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
@@ -1028,7 +1039,7 @@ class FastWAM(torch.nn.Module):
             shift_override=sigma_shift,
         )
         for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
-            timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+            timestep_action = step_t_action.repeat(batch_size).to(dtype=latents_action.dtype, device=self.device)
 
             pred_action_posi = self._predict_action_noise_with_cache(
                 latents_action=latents_action,
@@ -1043,9 +1054,10 @@ class FastWAM(torch.nn.Module):
 
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
-        return {
-            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
-        }
+        action_out = latents_action.detach().to(device="cpu", dtype=torch.float32)
+        if batch_size == 1:
+            action_out = action_out[0]
+        return {"action": action_out}
 
     @torch.no_grad()
     def infer(
