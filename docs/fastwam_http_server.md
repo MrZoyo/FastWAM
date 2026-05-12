@@ -45,6 +45,7 @@ CUDA_VISIBLE_DEVICES=0 \
 From `/home/Lyle/Projects/FastWAM`:
 
 ```bash
+CUDA_VISIBLE_DEVICES=1 \
 .venv/bin/python -B scripts/fastwam_http_server.py \
   --host 0.0.0.0 \
   --port 8117 \
@@ -53,6 +54,9 @@ From `/home/Lyle/Projects/FastWAM`:
   --dataset-stats runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/dataset_stats.json \
   --text-cache-dir data/text_embeds_cache/real_1048
 ```
+
+`CUDA_VISIBLE_DEVICES=1` starts the service on physical GPU 1. Inside the process,
+PyTorch still reports the selected visible GPU as `cuda:0`.
 
 ## Endpoints
 
@@ -101,8 +105,14 @@ You may pass `current_position`, `joint_position`, or `cartesian_position` as a 
 If `undistort` is present, the server treats the two model images as a stereo pair, scales
 `CameraInfo.K` from the calibration resolution to the received image resolution, applies
 OpenCV stereo undistortion/rectification, and then resizes the result to the model-aligned
-output size. If `output_size` is omitted, it defaults to the model image size, currently
-`[224, 224]` per camera.
+output size. This means the client may send bandwidth-saving resized frames, such as
+`640x480`, while keeping `left_camera_info.width/height` and `right_camera_info.width/height`
+at the original calibration resolution. Distortion coefficients `d` are not scaled. If
+`output_size` is omitted, it defaults to the model image size, currently `[224, 224]` per
+camera.
+
+`left_to_right` is optional. If it is provided, OpenCV uses stereo rectification; otherwise,
+the server undistorts the two eyes independently with their own intrinsics and distortion.
 
 `instruction` must have a matching precomputed text embedding in `--text-cache-dir`.
 If the cache is missing, the response is HTTP 500 with the missing cache path.
