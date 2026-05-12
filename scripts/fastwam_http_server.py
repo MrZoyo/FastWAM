@@ -40,6 +40,7 @@ if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from fastwam.closed_loop_eval.model_clients import FastWAMModelClient
+from fastwam.utils.rgb_undistort import opencv_available, undistort_stereo_side_from_camera_info
 
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,106 @@ def _decode_image(value: Any) -> np.ndarray:
         raise ValueError(f"Invalid base64 image: {exc}") from exc
 
 
+def _bool_value(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _undistort_config(payload: dict[str, Any]) -> dict[str, Any] | None:
+    value = payload.get("undistort")
+    if value is None or value is False:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("Field 'undistort' must be an object when enabled.")
+    if not _bool_value(value.get("enabled"), default=True):
+        return None
+    return value
+
+
+def _stereo_image_keys(options: dict[str, Any]) -> tuple[str, str]:
+    left_key = options.get("left_image_key") or options.get("left_key")
+    right_key = options.get("right_image_key") or options.get("right_key")
+    if left_key is not None and right_key is not None:
+        return str(left_key), str(right_key)
+    if _CLIENT is None:
+        raise RuntimeError("Model is not initialized.")
+    keys = list(_CLIENT.image_shapes.keys())
+    if len(keys) != 2:
+        raise ValueError("undistort requires left_image_key/right_image_key when the model uses more than 2 images.")
+    return keys[0], keys[1]
+
+
+def _stereo_output_size(options: dict[str, Any], left_key: str, right_key: str) -> tuple[int, int] | str | None:
+    output_size = options.get("output_size")
+    if output_size is not None:
+        return output_size
+    if _CLIENT is None:
+        return None
+    left_shape = _CLIENT.image_shapes.get(left_key)
+    right_shape = _CLIENT.image_shapes.get(right_key)
+    if left_shape is None or right_shape is None:
+        return None
+    left_size = (int(left_shape[2]), int(left_shape[1]))
+    right_size = (int(right_shape[2]), int(right_shape[1]))
+    if left_size != right_size:
+        raise ValueError(
+            f"Model image shapes for '{left_key}' and '{right_key}' must match for stereo undistort: "
+            f"{left_size} vs {right_size}"
+        )
+    return left_size
+
+
+def _apply_optional_undistortion(
+    *,
+    images: dict[str, np.ndarray],
+    payload: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    options = _undistort_config(payload)
+    if options is None:
+        return images
+
+    left_key, right_key = _stereo_image_keys(options)
+    if left_key not in images or right_key not in images:
+        raise ValueError(f"Field 'images' must contain stereo keys '{left_key}' and '{right_key}'.")
+
+    left_camera_info = options.get("left_camera_info")
+    right_camera_info = options.get("right_camera_info")
+    if not isinstance(left_camera_info, dict) or not isinstance(right_camera_info, dict):
+        raise ValueError("Field 'undistort' must provide 'left_camera_info' and 'right_camera_info' objects.")
+
+    output_size = _stereo_output_size(options, left_key, right_key)
+    alpha = float(options.get("alpha", 0.0))
+    output = dict(images)
+    output[left_key] = undistort_stereo_side_from_camera_info(
+        rgb=images[left_key],
+        left_camera_info=left_camera_info,
+        right_camera_info=right_camera_info,
+        output_size=output_size,
+        left_to_right=options.get("left_to_right"),
+        rotation=options.get("rotation"),
+        translation=options.get("translation"),
+        alpha=alpha,
+        eye="left",
+    )
+    output[right_key] = undistort_stereo_side_from_camera_info(
+        rgb=images[right_key],
+        left_camera_info=left_camera_info,
+        right_camera_info=right_camera_info,
+        output_size=output_size,
+        left_to_right=options.get("left_to_right"),
+        rotation=options.get("rotation"),
+        translation=options.get("translation"),
+        alpha=alpha,
+        eye="right",
+    )
+    return output
+
+
 def _require_array(payload: dict[str, Any], key: str) -> np.ndarray:
     if key not in payload:
         raise ValueError(f"Missing required field '{key}'.")
@@ -97,6 +198,7 @@ def _request_to_model_input(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"Missing required image keys: {missing}.")
 
     images = {str(key): _decode_image(value) for key, value in images_payload.items()}
+    images = _apply_optional_undistortion(images=images, payload=payload)
     proprio_raw = _require_array(payload, "proprio_raw")
     if _CLIENT is not None and proprio_raw.size != _CLIENT.proprio_dim:
         raise ValueError(f"Field 'proprio_raw' must have length {_CLIENT.proprio_dim}, got {proprio_raw.size}.")
@@ -130,6 +232,16 @@ def _schema() -> dict[str, Any]:
         "request": {
             "instruction": "optional string; must have a matching text cache when text encoder is not loaded",
             "images": "object mapping training camera keys to base64 encoded PNG/JPEG RGB images",
+            "undistort": "optional object with stereo calibration; when present, images are undistorted before resize",
+            "undistort.left_image_key": "optional image key for the left stereo frame; defaults to the first model key",
+            "undistort.right_image_key": "optional image key for the right stereo frame; defaults to the second model key",
+            "undistort.left_camera_info": "required CameraInfo-style object for the left camera",
+            "undistort.right_camera_info": "required CameraInfo-style object for the right camera",
+            "undistort.left_to_right": "optional 4x4 transform or flattened 16 values for stereo rectification",
+            "undistort.rotation": "optional 3x3 stereo rotation, alternative to left_to_right",
+            "undistort.translation": "optional 3D stereo translation, alternative to left_to_right",
+            "undistort.output_size": "optional [width,height]; defaults to the model image size such as [224,224]",
+            "undistort.alpha": "optional OpenCV free scaling parameter, default 0.0",
             "proprio_raw": "raw 7D real_1048 proprio vector [joint0..joint5, gripper]",
             "current_position": "optional 6D base position for delta accumulation; defaults to proprio_raw[:6]",
         },
@@ -144,6 +256,14 @@ def _schema() -> dict[str, Any]:
             "instruction": "open the door",
             "images": {"head_left": "<base64>", "right_wrist_left": "<base64>"},
             "proprio_raw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04],
+            "undistort": {
+                "enabled": True,
+                "left_image_key": "head_left",
+                "right_image_key": "right_wrist_left",
+                "left_camera_info": {"width": 1280, "height": 1088, "k": "[...]", "d": "[...]"},
+                "right_camera_info": {"width": 1280, "height": 1088, "k": "[...]", "d": "[...]"},
+                "output_size": [224, 224],
+            },
         },
     }
 
@@ -264,6 +384,7 @@ def main(argv: list[str] | None = None) -> None:
         "action_horizon": _CLIENT.action_horizon,
         "num_inference_steps": _CLIENT.num_inference_steps,
         "device": _CLIENT.device,
+        "opencv_available": opencv_available(),
     }
 
     httpd = ThreadingHTTPServer((args.host, args.port), FastWAMHandler)

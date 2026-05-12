@@ -2,6 +2,7 @@
 
 The server loads one FastWAM checkpoint and exposes action chunk inference over JSON HTTP.
 It uses only the Python standard library for HTTP, so it does not require FastAPI or uvicorn.
+Optional stereo undistortion uses OpenCV if you send `undistort` calibration in the request.
 
 ## Prepare real_1048 Assets
 
@@ -69,7 +70,26 @@ From `/home/Lyle/Projects/FastWAM`:
     "head_left": "<base64 encoded png/jpeg>",
     "right_wrist_left": "<base64 encoded png/jpeg>"
   },
-  "proprio_raw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04]
+  "proprio_raw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04],
+  "undistort": {
+    "enabled": true,
+    "left_image_key": "head_left",
+    "right_image_key": "right_wrist_left",
+    "left_camera_info": {
+      "width": 1280,
+      "height": 1088,
+      "k": [ ... ],
+      "d": [ ... ]
+    },
+    "right_camera_info": {
+      "width": 1280,
+      "height": 1088,
+      "k": [ ... ],
+      "d": [ ... ]
+    },
+    "output_size": [224, 224],
+    "alpha": 0.0
+  }
 }
 ```
 
@@ -78,9 +98,16 @@ From `/home/Lyle/Projects/FastWAM`:
 The server accumulates the predicted first six delta dimensions onto `proprio_raw[:6]` by default.
 You may pass `current_position`, `joint_position`, or `cartesian_position` as a 6D override if needed.
 
+If `undistort` is present, the server treats the two model images as a stereo pair, scales
+`CameraInfo.K` from the calibration resolution to the received image resolution, applies
+OpenCV stereo undistortion/rectification, and then resizes the result to the model-aligned
+output size. If `output_size` is omitted, it defaults to the model image size, currently
+`[224, 224]` per camera.
+
 `instruction` must have a matching precomputed text embedding in `--text-cache-dir`.
 If the cache is missing, the response is HTTP 500 with the missing cache path.
 Malformed requests, such as missing camera keys or a non-7D `proprio_raw`, return HTTP 400.
+If undistortion is requested but calibration is incomplete, the response is HTTP 400.
 
 ## Response
 
@@ -102,5 +129,6 @@ computed as predicted delta plus the current six joint values; the last dimensio
 ## Verified On 5090
 
 - `GET /health` reports `image_keys=["head_left","right_wrist_left"]`, `proprio_dim=7`, and checkpoint `step_020000.pt`.
+- `GET /health` also reports `opencv_available=true` on the 5090 runtime.
 - A real dataset frame from `/data_hdd/Lyle/Datasets/real_1048` returns HTTP 200 with `action_format="joint_absolute"` and `actions` shape `[32,7]`.
 - Malformed requests return HTTP 400, including non-7D `proprio_raw` and missing camera keys.
