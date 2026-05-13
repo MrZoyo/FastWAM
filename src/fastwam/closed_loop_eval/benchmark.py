@@ -26,6 +26,7 @@ from .runner import (
     _infer_action_dim,
     _parse_camera_map,
     _resolve_control_mode,
+    _resolve_overrides,
     _validate_camera_map,
     _validated_actions,
 )
@@ -755,7 +756,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if stale_path.exists():
             stale_path.unlink()
 
-    overrides = [*args.override]
+    overrides = _resolve_overrides(args)
     if not any(item.startswith("env.batch_size=") for item in overrides):
         overrides.append(f"env.batch_size={args.batch_size}")
     for override in DEFAULT_SENSOR_OVERRIDES:
@@ -1038,6 +1039,11 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--task", default=None)
     parser.add_argument("--override", action="append", default=[])
+    parser.add_argument(
+        "--disable-arm-eef-randomization",
+        action="store_true",
+        help="Force task.randomization.arm.eef.{x,y,z} to [0,0]; see runner.py for rationale.",
+    )
     parser.add_argument("--output-dir", default="runs/aao_benchmark")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--total-episodes", type=int, default=4)

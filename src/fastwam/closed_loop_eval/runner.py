@@ -19,12 +19,6 @@ from .sim_service_client import DEFAULT_AAO_ROOT, SimulatorServiceClient
 
 logger = logging.getLogger(__name__)
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_MIX_RUN = _REPO_ROOT / "runs/mix_uncond_2cam224_1e-4/mix_uncond_20k_20260507_024400"
-DEFAULT_MIX_CONFIG = DEFAULT_MIX_RUN / "config.yaml"
-DEFAULT_MIX_STATS = DEFAULT_MIX_RUN / "dataset_stats.json"
-DEFAULT_MIX_CKPT = DEFAULT_MIX_RUN / "checkpoints/weights/step_020000.pt"
-
 
 def _parse_camera_map(value: str) -> dict[str, str]:
     mapping: dict[str, str] = {}
@@ -97,11 +91,10 @@ def _clamp_gripper(
 
 
 def _effective_gripper_bounds(args: argparse.Namespace) -> tuple[float | None, float | None]:
-    if args.gripper_min is not None or args.gripper_max is not None:
-        return args.gripper_min, args.gripper_max
-    if args.action_format == "cartesian_absolute":
-        return 0.02, 0.0945
-    return None, None
+    # No hardcoded defaults: clamping range is dataset-specific (e.g. cup GT max=0.1144,
+    # real_1048 GT max=0.0904). Users / benchmark profiles must opt in via
+    # --gripper-min / --gripper-max when they actually want clamping.
+    return args.gripper_min, args.gripper_max
 
 
 def _infer_action_dim(sim_info: dict[str, Any], action_format: str, operator: str = "arm") -> int | None:
@@ -133,6 +126,19 @@ def _resolve_control_mode(args: argparse.Namespace) -> str:
 
 def _effective_sim_loop_frequency(args: argparse.Namespace) -> float:
     return float(getattr(args, "sim_loop_frequency", 0.0))
+
+
+def _resolve_overrides(args: argparse.Namespace) -> list[str]:
+    """Build the final hydra override list, prepending implicit toggles before user overrides
+    so a later --override on the same key still wins."""
+    implicit: list[str] = []
+    if getattr(args, "disable_arm_eef_randomization", False):
+        implicit.extend([
+            "task.randomization.arm.eef.x=[0.0,0.0]",
+            "task.randomization.arm.eef.y=[0.0,0.0]",
+            "task.randomization.arm.eef.z=[0.0,0.0]",
+        ])
+    return implicit + list(args.override)
 
 
 def _continuous_hold_seconds(args: argparse.Namespace, sim_info: dict[str, Any] | None = None) -> float:
@@ -250,6 +256,18 @@ def _build_model_client(args: argparse.Namespace) -> BaseModelClient:
     if args.model_client == "hold-joint":
         return HoldJointModelClient(horizon=args.action_horizon)
     if args.model_client == "fastwam":
+        missing = [
+            name for name, value in (
+                ("--fastwam-config", args.fastwam_config),
+                ("--checkpoint", args.checkpoint),
+                ("--dataset-stats", args.dataset_stats),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                f"--model-client=fastwam requires {', '.join(missing)} to be set explicitly."
+            )
         return FastWAMModelClient(
             config_path=args.fastwam_config,
             checkpoint_path=args.checkpoint,
@@ -291,7 +309,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         sim.connect()
         init_result = sim.init(
             config_name=args.task,
-            overrides=list(args.override),
+            overrides=_resolve_overrides(args),
             action_format=args.action_format,
         )
         sim_info = init_result["info"]
@@ -505,6 +523,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--aao-root", default=str(DEFAULT_AAO_ROOT))
     parser.add_argument("--task", default="open_door_airbot_play_gs")
     parser.add_argument("--override", action="append", default=[])
+    parser.add_argument(
+        "--disable-arm-eef-randomization",
+        action="store_true",
+        help="Force task.randomization.arm.eef.{x,y,z} to [0,0] so the arm "
+             "always resets to its task_operators.arm.initial_state pose. Useful "
+             "when the training dataset was collected without arm-eef randomization.",
+    )
     parser.add_argument("--output-dir", default="runs/aao_closed_loop/open_door_airbot_play_gs")
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max-updates", type=int, default=40)
@@ -519,9 +544,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--gripper-index", type=int, default=-1)
     parser.add_argument("--camera-map", default="head_left=env2_cam,right_wrist_left=eef_wrist_cam")
     parser.add_argument("--model-client", choices=("hold", "hold-joint", "fastwam"), default="hold")
-    parser.add_argument("--fastwam-config", default=str(DEFAULT_MIX_CONFIG))
-    parser.add_argument("--checkpoint", default=str(DEFAULT_MIX_CKPT))
-    parser.add_argument("--dataset-stats", default=str(DEFAULT_MIX_STATS))
+    parser.add_argument("--fastwam-config", default=None,
+        help="Required when --model-client=fastwam. Path to the training config.yaml.")
+    parser.add_argument("--checkpoint", default=None,
+        help="Required when --model-client=fastwam. Path to the model checkpoint .pt file.")
+    parser.add_argument("--dataset-stats", default=None,
+        help="Required when --model-client=fastwam. Path to the dataset_stats.json paired with the checkpoint; "
+             "different runs/datasets have different normalization stats, do not rely on a fallback.")
     parser.add_argument("--text-cache-dir", default="data/text_embeds_cache/mix")
     parser.add_argument("--instruction", default="open the door")
     parser.add_argument("--model-action-mode", choices=("delta6_abs_gripper", "absolute", "absolute_joint"), default="delta6_abs_gripper")
