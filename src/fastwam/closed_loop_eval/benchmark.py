@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_PROFILE_DIR = _REPO_ROOT / "configs" / "aao_benchmark"
+DEFAULT_STRIDE = 8
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,8 @@ class BenchmarkProfile:
     action_repeat: int
     train_action_hz: float
     max_updates: int
+    stride: int | None = None
+    disable_arm_randomization: bool = False
     proprio_mode: str = "cartesian"
     proprio_dim: int | None = None
     fastwam_config: str | None = None
@@ -108,6 +111,8 @@ def _profile_from_dict(payload: dict[str, Any], *, source: Path | str) -> Benchm
     if proprio_mode not in {"cartesian", "joint"}:
         raise RuntimeError(f"Benchmark profile {source} has unsupported proprio_mode={proprio_mode!r}.")
     proprio_dim = payload.get("proprio_dim")
+    stride = payload.get("stride")
+    disable_arm_randomization = bool(payload.get("disable_arm_randomization", False))
     return BenchmarkProfile(
         name=str(payload["name"]),
         task=str(payload["task"]),
@@ -116,6 +121,8 @@ def _profile_from_dict(payload: dict[str, Any], *, source: Path | str) -> Benchm
         action_repeat=int(payload["action_repeat"]),
         train_action_hz=float(payload["train_action_hz"]),
         max_updates=int(payload["max_updates"]),
+        stride=None if stride is None else int(stride),
+        disable_arm_randomization=disable_arm_randomization,
         proprio_mode=proprio_mode,
         proprio_dim=None if proprio_dim is None else int(proprio_dim),
         fastwam_config=None if payload.get("fastwam_config") is None else str(payload["fastwam_config"]),
@@ -150,6 +157,14 @@ def _resolve_profile(args: argparse.Namespace) -> BenchmarkProfile:
         "action_repeat": int(args.action_repeat if args.action_repeat is not None else profile.action_repeat),
         "train_action_hz": float(args.train_action_hz if args.train_action_hz is not None else profile.train_action_hz),
         "max_updates": int(args.max_updates if args.max_updates is not None else profile.max_updates),
+        "stride": int(args.stride if args.stride is not None else (
+            profile.stride if profile.stride is not None else DEFAULT_STRIDE
+        )),
+        "disable_arm_randomization": bool(
+            args.disable_arm_randomization
+            if args.disable_arm_randomization is not None
+            else profile.disable_arm_randomization
+        ),
         "proprio_mode": args.proprio_mode if args.proprio_mode is not None else profile.proprio_mode,
         "proprio_dim": args.proprio_dim if args.proprio_dim is not None else profile.proprio_dim,
         "fastwam_config": args.fastwam_config if args.fastwam_config is not None else profile.fastwam_config,
@@ -716,8 +731,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--batch-size must be positive.")
     if args.total_episodes <= 0:
         raise ValueError("--total-episodes must be positive.")
-    if args.stride <= 0:
-        raise ValueError("--stride must be positive.")
     if args.action_horizon <= 0:
         raise ValueError("--action-horizon must be positive.")
     if args.action_format != "cartesian_absolute":
@@ -733,6 +746,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--model-worker-timeout-sec must be positive.")
 
     profile = _resolve_profile(args)
+    if profile.stride is None or profile.stride <= 0:
+        raise ValueError("--stride/profile.stride must be positive.")
     if profile.action_repeat <= 0:
         raise ValueError("--action-repeat/profile.action_repeat must be positive.")
     if profile.max_updates <= 0:
@@ -743,6 +758,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     args.instruction = profile.instruction
     args.camera_map = profile.camera_map
     args.action_repeat = profile.action_repeat
+    args.stride = int(profile.stride)
+    args.disable_arm_randomization = bool(profile.disable_arm_randomization)
     args.train_action_hz = profile.train_action_hz
     args.max_updates = profile.max_updates
     args.proprio_mode = profile.proprio_mode
@@ -1044,11 +1061,30 @@ def build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Force task.randomization.arm.eef.{x,y,z} to [0,0]; see runner.py for rationale.",
     )
+    parser.add_argument(
+        "--disable-arm-randomization",
+        action="store_true",
+        default=None,
+        help="Force task.randomization.arm.base/eef.{x,y,z} to [0,0]. "
+             "The open-door profile enables this by default.",
+    )
+    parser.add_argument(
+        "--enable-arm-randomization",
+        action="store_false",
+        dest="disable_arm_randomization",
+        help="Keep task.randomization.arm enabled, overriding profile.disable_arm_randomization.",
+    )
     parser.add_argument("--output-dir", default="runs/aao_benchmark")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--total-episodes", type=int, default=4)
     parser.add_argument("--max-updates", type=int, default=None)
-    parser.add_argument("--stride", type=int, default=8)
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=None,
+        help="Model actions to execute from each predicted chunk before replanning. "
+             "Defaults to profile.stride when present, otherwise 8.",
+    )
     parser.add_argument("--action-repeat", type=int, default=None)
     parser.add_argument("--action-horizon", type=int, default=32)
     parser.add_argument("--action-format", choices=("cartesian_absolute",), default="cartesian_absolute")

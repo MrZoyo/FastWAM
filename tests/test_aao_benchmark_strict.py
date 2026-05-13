@@ -9,11 +9,14 @@ from fastwam.closed_loop_eval.benchmark import (
     _extract_task_update,
     _load_named_profile,
     _load_profile_file,
+    _resolve_profile,
     _require_vector_dim,
 )
 from fastwam.closed_loop_eval.model_clients import FastWAMModelClient
 from fastwam.closed_loop_eval.observation_adapter import AAOObservationAdapter
 from fastwam.closed_loop_eval.runner import _validated_actions
+from fastwam.closed_loop_eval.runner import _resolve_overrides
+from fastwam.closed_loop_eval.runner import _default_disable_arm_randomization
 from fastwam.closed_loop_eval.sim_service_client import SimulatorServiceClient
 
 
@@ -64,6 +67,8 @@ def test_default_benchmark_profiles_load_from_yaml() -> None:
     cup = _load_named_profile("cup_on_coaster_gs_airbot_p7")
     assert open_door.fastwam_config.endswith("configs/task/mix_uncond_2cam224_1e-4.yaml")
     assert open_door.proprio_mode == "joint"
+    assert open_door.stride == 32
+    assert open_door.disable_arm_randomization is True
     assert cup.fastwam_config.endswith("configs/task/cup_uncond_2cam224_1e-4.yaml")
     assert cup.proprio_mode == "joint"
 
@@ -93,6 +98,76 @@ def test_custom_profile_config_loads_relative_paths(tmp_path) -> None:
     assert profile.task == "custom_task"
     assert profile.action_repeat == 3
     assert profile.fastwam_config.endswith("configs/task/mix_uncond_2cam224_1e-4.yaml")
+
+
+def test_benchmark_profile_stride_can_be_overridden() -> None:
+    args = SimpleNamespace(
+        profile="open_door_airbot_play_gs",
+        profile_config=None,
+        task=None,
+        instruction=None,
+        camera_map=None,
+        action_repeat=None,
+        train_action_hz=None,
+        max_updates=None,
+        stride=12,
+        disable_arm_randomization=None,
+        proprio_mode=None,
+        proprio_dim=None,
+        fastwam_config=None,
+        text_cache_dir=None,
+    )
+
+    profile = _resolve_profile(args)
+
+    assert profile.stride == 12
+    assert profile.disable_arm_randomization is True
+
+
+def test_benchmark_profile_arm_randomization_can_be_reenabled() -> None:
+    args = SimpleNamespace(
+        profile="open_door_airbot_play_gs",
+        profile_config=None,
+        task=None,
+        instruction=None,
+        camera_map=None,
+        action_repeat=None,
+        train_action_hz=None,
+        max_updates=None,
+        stride=None,
+        disable_arm_randomization=False,
+        proprio_mode=None,
+        proprio_dim=None,
+        fastwam_config=None,
+        text_cache_dir=None,
+    )
+
+    profile = _resolve_profile(args)
+
+    assert profile.disable_arm_randomization is False
+
+
+def test_disable_arm_randomization_adds_base_and_eef_overrides() -> None:
+    args = SimpleNamespace(
+        disable_arm_randomization=True,
+        disable_arm_eef_randomization=False,
+        override=["task.randomization.arm.base.x=[0.1,0.1]"],
+    )
+
+    overrides = _resolve_overrides(args)
+
+    assert "task.randomization.arm.base.x=[0.0,0.0]" in overrides
+    assert "task.randomization.arm.base.y=[0.0,0.0]" in overrides
+    assert "task.randomization.arm.base.z=[0.0,0.0]" in overrides
+    assert "task.randomization.arm.eef.x=[0.0,0.0]" in overrides
+    assert "task.randomization.arm.eef.y=[0.0,0.0]" in overrides
+    assert "task.randomization.arm.eef.z=[0.0,0.0]" in overrides
+    assert overrides[-1] == "task.randomization.arm.base.x=[0.1,0.1]"
+
+
+def test_open_door_runner_disables_arm_randomization_by_default() -> None:
+    assert _default_disable_arm_randomization("open_door_airbot_play_back_gs") is True
+    assert _default_disable_arm_randomization("cup_on_coaster_gs_airbot_p7") is False
 
 
 def test_task_update_requires_batch_sized_done_and_success() -> None:

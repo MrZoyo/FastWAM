@@ -5,6 +5,8 @@ camera_map: head_left=env2_cam,right_wrist_left=eef_wrist_cam
 action_repeat: 5
 train_action_hz: 20.0
 max_updates: 160
+stride: 32
+disable_arm_randomization: true
 proprio_mode: joint
 proprio_dim: 7
 fastwam_config: configs/task/mix_uncond_2cam224_1e-4.yaml

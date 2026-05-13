@@ -60,19 +60,24 @@ Control timing is handled by `--sim-loop-frequency`:
 
 For the mix/open-door data, `/home/zoyo/mix/meta/info.json` reports 20Hz
 actions, while AAO open-door runs at 100Hz. Therefore the default closed-loop
-settings are:
+settings execute the full 32-action window before replanning:
 
 ```bash
 .venv/bin/python -B scripts/run_aao_closed_loop_eval.py \
   --model-client fastwam \
   --task open_door_airbot_play_gs \
   --action-horizon 32 \
-  --stride 8 \
+  --stride 32 \
   --action-repeat 5 \
   --gripper-min 0.02 \
   --gripper-max 0.0945 \
   --sim-loop-frequency 0
 ```
+
+Open-door closed-loop runs disable AAO arm base/EEF reset randomization by
+default so the simulator starts near the fixed base/home distribution used by
+the local LeRobot replay data. Pass `--enable-arm-randomization` only when
+intentionally testing reset robustness.
 
 Batch benchmark profiles live in `configs/aao_benchmark/`. The current presets
 are `open_door_airbot_play_gs` and `cup_on_coaster_gs_airbot_p7`; new test envs
@@ -86,6 +91,17 @@ chunk left by one frame, cumulatively integrates the first 6 dimensions from the
 current EEF pose, and leaves the gripper as an absolute target. If a future
 checkpoint is trained on already-forward deltas `pose[t+1] - pose[t]`, use
 `--model-action-mode delta6_abs_gripper_forward`.
+
+For open-door checkpoints trained with `action_horizon=32`, avoid the old
+`stride=8` setting unless you are intentionally debugging receding-horizon
+behavior. Local replay shows the first large handle-approach motion can appear
+near the end of the first 32-action window; replanning after only 8 actions can
+discard that motion repeatedly. The open-door benchmark profile records
+`stride: 32`, and the batch benchmark uses that profile value unless `--stride`
+is passed explicitly. The same profile also records
+`disable_arm_randomization: true`, so batch benchmark open-door runs disable
+AAO arm base/EEF reset randomization unless `--enable-arm-randomization` is
+passed.
 
 Both preset profiles use 7D EEF pose + gripper model actions. The cup profile
 uses 8D joint + gripper proprio as model input, and open-door checkpoints use
@@ -239,7 +255,7 @@ backgrounds, and the shared `real_knob1.ply` / `real_lock1.ply` handle assets:
   --device cuda:0 \
   --output-dir runs/aao_closed_loop/fastwam_mix20k_open_door_gs_30env_repeat5_lockstep \
   --num-combos 30 \
-  --strides 4,8 \
+  --strides 32 \
   --max-updates 160 \
   --action-repeat 5 \
   --action-horizon 32 \

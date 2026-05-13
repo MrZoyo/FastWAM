@@ -57,7 +57,7 @@ DEFAULT_WALLS = (
     "wall12",
     "wall13",
 )
-DEFAULT_STRIDES = (4, 8)
+DEFAULT_STRIDES = (32,)
 
 
 def _build_model_client(args: argparse.Namespace) -> BaseModelClient:

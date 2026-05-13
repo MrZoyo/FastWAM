@@ -19,6 +19,15 @@ from .sim_service_client import DEFAULT_AAO_ROOT, SimulatorServiceClient
 
 logger = logging.getLogger(__name__)
 
+ARM_RANDOMIZATION_ZERO_OVERRIDES = (
+    "task.randomization.arm.base.x=[0.0,0.0]",
+    "task.randomization.arm.base.y=[0.0,0.0]",
+    "task.randomization.arm.base.z=[0.0,0.0]",
+    "task.randomization.arm.eef.x=[0.0,0.0]",
+    "task.randomization.arm.eef.y=[0.0,0.0]",
+    "task.randomization.arm.eef.z=[0.0,0.0]",
+)
+
 
 def _parse_camera_map(value: str) -> dict[str, str]:
     mapping: dict[str, str] = {}
@@ -128,10 +137,16 @@ def _effective_sim_loop_frequency(args: argparse.Namespace) -> float:
     return float(getattr(args, "sim_loop_frequency", 0.0))
 
 
+def _default_disable_arm_randomization(task: str) -> bool:
+    return str(task).startswith("open_door")
+
+
 def _resolve_overrides(args: argparse.Namespace) -> list[str]:
     """Build the final hydra override list, prepending implicit toggles before user overrides
     so a later --override on the same key still wins."""
     implicit: list[str] = []
+    if getattr(args, "disable_arm_randomization", False):
+        implicit.extend(ARM_RANDOMIZATION_ZERO_OVERRIDES)
     if getattr(args, "disable_arm_eef_randomization", False):
         implicit.extend([
             "task.randomization.arm.eef.x=[0.0,0.0]",
@@ -183,6 +198,8 @@ def _control_metadata(
         "gripper_min": gripper_min,
         "gripper_max": gripper_max,
         "gripper_index": int(args.gripper_index),
+        "disable_arm_randomization": bool(getattr(args, "disable_arm_randomization", False)),
+        "disable_arm_eef_randomization": bool(getattr(args, "disable_arm_eef_randomization", False)),
         "ignore_done": bool(getattr(args, "ignore_done", False)),
         "stop_on_done": not bool(getattr(args, "ignore_done", False)),
         "control_mode": control_mode,
@@ -295,6 +312,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--action-horizon must be positive.")
     if args.max_updates <= 0:
         raise ValueError("--max-updates must be positive.")
+    if getattr(args, "disable_arm_randomization", None) is None:
+        args.disable_arm_randomization = _default_disable_arm_randomization(args.task)
     output_root = Path(args.output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -530,10 +549,24 @@ def build_argparser() -> argparse.ArgumentParser:
              "always resets to its task_operators.arm.initial_state pose. Useful "
              "when the training dataset was collected without arm-eef randomization.",
     )
+    parser.add_argument(
+        "--disable-arm-randomization",
+        action="store_true",
+        default=None,
+        help="Force task.randomization.arm.base/eef.{x,y,z} to [0,0]. Use this "
+             "when evaluating checkpoints whose training episodes start from a fixed "
+             "arm base and home joint distribution.",
+    )
+    parser.add_argument(
+        "--enable-arm-randomization",
+        action="store_false",
+        dest="disable_arm_randomization",
+        help="Keep task.randomization.arm enabled. Open-door tasks disable it by default.",
+    )
     parser.add_argument("--output-dir", default="runs/aao_closed_loop/open_door_airbot_play_gs")
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max-updates", type=int, default=40)
-    parser.add_argument("--stride", type=int, default=8)
+    parser.add_argument("--stride", type=int, default=32)
     parser.add_argument("--action-repeat", type=int, default=5)
     parser.add_argument("--action-horizon", type=int, default=32)
     parser.add_argument("--action-format", choices=("cartesian_absolute", "joint_absolute"), default="cartesian_absolute")
