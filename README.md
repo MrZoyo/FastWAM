@@ -37,18 +37,17 @@ The integration is intentionally kept separate from the training pipeline:
 - Batch benchmark smoke entrypoint:
   `scripts/run_aao_benchmark_smoke_tests.py`.
 
-The default open-door task is `open_door_airbot_play_gs`. The current bridge
-uses the mix 20k checkpoint by default:
+The default open-door task is `open_door_airbot_play_back_gs`, where the door
+handle is on the left side. This matches the local real+sim open-door training
+and replay setup. Use `--task open_door_airbot_play_gs` only when intentionally
+testing the front/right-handle variant.
 
-```text
-runs/mix_uncond_2cam224_1e-4/mix_uncond_20k_20260507_024400/checkpoints/weights/step_020000.pt
-```
-
-Model run directories under `runs/` are intentionally ignored by git. Copy or
-download the corresponding `config.yaml`, `dataset_stats.json`, text embedding
-cache, and checkpoint before using `--model-client fastwam`; use
-`--fastwam-config`, `--dataset-stats`, `--text-cache-dir`, and `--checkpoint`
-to point at a different run.
+No checkpoint path is hard-coded in the closed-loop runner, benchmark, visual
+rollout, or sweep scripts. When using `--model-client fastwam`, always pass the
+run-specific paths explicitly: `--fastwam-config`, `--checkpoint`,
+`--dataset-stats`, and `--text-cache-dir`. Model run directories under `runs/`
+are intentionally ignored by git, and `dataset_stats.json` must match the
+checkpoint's training data.
 
 Control timing is handled by `--sim-loop-frequency`:
 
@@ -58,14 +57,23 @@ Control timing is handled by `--sim-loop-frequency`:
   simulation loop at that frequency, while the runner updates the current
   target action with `set_cartesian_action()` and replans from new observations.
 
-For the mix/open-door data, `/home/zoyo/mix/meta/info.json` reports 20Hz
-actions, while AAO open-door runs at 100Hz. Therefore the default closed-loop
-settings execute the full 32-action window before replanning:
+For the local open-door LeRobot data, actions are 20Hz while AAO open-door runs
+at 100Hz. Therefore the default closed-loop settings repeat each model action
+for 5 AAO updates and execute the full 32-action window before replanning:
 
 ```bash
+OPEN_DOOR_CONFIG=configs/task/real_sim_open_door_uncond_2cam224_1e-4_20k.yaml
+OPEN_DOOR_CKPT=runs/real_sim_open_door_uncond_2cam224_1e-4_20k/2026-05-13_03-21-04/checkpoints/weights/step_020000.pt
+OPEN_DOOR_STATS=runs/real_sim_open_door_uncond_2cam224_1e-4_20k/2026-05-13_03-21-04/dataset_stats.json
+OPEN_DOOR_TEXT_CACHE=data/text_embeds_cache/real_sim_open_door
+
 .venv/bin/python -B scripts/run_aao_closed_loop_eval.py \
   --model-client fastwam \
-  --task open_door_airbot_play_gs \
+  --task open_door_airbot_play_back_gs \
+  --fastwam-config "$OPEN_DOOR_CONFIG" \
+  --checkpoint "$OPEN_DOOR_CKPT" \
+  --dataset-stats "$OPEN_DOOR_STATS" \
+  --text-cache-dir "$OPEN_DOOR_TEXT_CACHE" \
   --action-horizon 32 \
   --stride 32 \
   --action-repeat 5 \
@@ -80,8 +88,10 @@ the local LeRobot replay data. Pass `--enable-arm-randomization` only when
 intentionally testing reset robustness.
 
 Batch benchmark profiles live in `configs/aao_benchmark/`. The current presets
-are `open_door_airbot_play_gs` and `cup_on_coaster_gs_airbot_p7`; new test envs
-can be supplied with `--profile-config <yaml>`. AAO `apply_pose_action()`
+are `open_door_airbot_play_back_gs`, `open_door_airbot_play_gs`, and
+`cup_on_coaster_gs_airbot_p7`; new test envs can be supplied with
+`--profile-config <yaml>`. The benchmark default is
+`open_door_airbot_play_back_gs`. AAO `apply_pose_action()`
 expects absolute EEF pose targets, so the bridge always sends
 `cartesian_absolute` commands. The default FastWAM action mode is
 `delta6_abs_gripper`: the model is trained on LeRobot frame-aligned EEF deltas
@@ -143,13 +153,17 @@ with `--action-repeat 5`, this produces 320 frames:
 
 ```bash
 .venv/bin/python -B scripts/run_aao_visual_rollout.py \
-  --task open_door_airbot_play_gs \
+  --task open_door_airbot_play_back_gs \
+  --fastwam-config "$OPEN_DOOR_CONFIG" \
+  --checkpoint "$OPEN_DOOR_CKPT" \
+  --dataset-stats "$OPEN_DOOR_STATS" \
+  --text-cache-dir "$OPEN_DOOR_TEXT_CACHE" \
   --num-windows 2 \
   --action-horizon 32 \
   --action-repeat 5 \
   --num-video-frames 9 \
   --frame-sampling sim-update \
-  --output-dir runs/aao_closed_loop/mix20k_open_door_gs_2win_visual_simupdate
+  --output-dir runs/aao_closed_loop/open_door_back_gs_2win_visual_simupdate
 ```
 
 The working notes for this integration are:
@@ -253,7 +267,7 @@ backgrounds, and the shared `real_knob1.ply` / `real_lock1.ply` handle assets:
 .venv/bin/python -B scripts/run_aao_open_door_gs_sweep.py \
   --gpu 0 \
   --device cuda:0 \
-  --output-dir runs/aao_closed_loop/fastwam_mix20k_open_door_gs_30env_repeat5_lockstep \
+  --output-dir runs/aao_closed_loop/open_door_back_gs_30env_repeat5_lockstep \
   --num-combos 30 \
   --strides 32 \
   --max-updates 160 \

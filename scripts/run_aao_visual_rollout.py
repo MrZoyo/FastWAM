@@ -42,9 +42,6 @@ from fastwam.closed_loop_eval.episode_recorder import to_jsonable
 from fastwam.closed_loop_eval.model_clients import FastWAMModelClient
 from fastwam.closed_loop_eval.observation_adapter import AAOObservationAdapter, split_batched_observation
 from fastwam.closed_loop_eval.runner import (
-    DEFAULT_MIX_CKPT,
-    DEFAULT_MIX_CONFIG,
-    DEFAULT_MIX_STATS,
     _clamp_gripper,
     _extract_mujoco_diagnostics,
     _numeric_delta,
@@ -156,6 +153,17 @@ def _video_frame_index(
 
 
 def _build_model_client(args: argparse.Namespace) -> FastWAMModelClient:
+    missing = [
+        name for name, value in (
+            ("--fastwam-config", args.fastwam_config),
+            ("--checkpoint", args.checkpoint),
+            ("--dataset-stats", args.dataset_stats),
+            ("--text-cache-dir", args.text_cache_dir),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(f"visual rollout requires {', '.join(missing)} to be set explicitly.")
     return FastWAMModelClient(
         config_path=args.fastwam_config,
         checkpoint_path=args.checkpoint,
@@ -417,9 +425,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aao-root", default=str(DEFAULT_AAO_ROOT))
-    parser.add_argument("--task", default="open_door_airbot_play_gs")
+    parser.add_argument("--task", default="open_door_airbot_play_back_gs")
     parser.add_argument("--override", action="append", default=[])
-    parser.add_argument("--output-dir", default="runs/aao_closed_loop/mix20k_open_door_gs_2win_visual")
+    parser.add_argument("--output-dir", default="runs/aao_closed_loop/open_door_back_gs_2win_visual")
     parser.add_argument("--num-windows", type=int, default=2)
     parser.add_argument("--max-model-steps", type=int, default=None)
     parser.add_argument("--action-horizon", type=int, default=32)
@@ -432,10 +440,10 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Save one output frame per model action or per AAO simulator update.",
     )
     parser.add_argument("--camera-map", default="head_left=env2_cam,right_wrist_left=eef_wrist_cam")
-    parser.add_argument("--fastwam-config", default=str(DEFAULT_MIX_CONFIG))
-    parser.add_argument("--checkpoint", default=str(DEFAULT_MIX_CKPT))
-    parser.add_argument("--dataset-stats", default=str(DEFAULT_MIX_STATS))
-    parser.add_argument("--text-cache-dir", default="data/text_embeds_cache/mix")
+    parser.add_argument("--fastwam-config", default=None)
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--dataset-stats", default=None)
+    parser.add_argument("--text-cache-dir", default=None)
     parser.add_argument("--instruction", default="open the door")
     parser.add_argument(
         "--model-action-mode",

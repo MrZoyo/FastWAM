@@ -524,7 +524,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--variant", default=None, help="Door variant tag such as door_2; defaults to the conversion report source.")
     parser.add_argument("--variant-env-index", type=int, default=None, help="AAO batch index for the selected variant; defaults to the numeric suffix in --variant.")
     parser.add_argument("--aao-root", default=str(DEFAULT_AAO_ROOT))
-    parser.add_argument("--task", default="open_door_airbot_play_gs")
+    parser.add_argument("--task", default="open_door_airbot_play_back_gs")
     parser.add_argument("--override", action="append", default=[])
     parser.add_argument("--batch-size", type=int, default=5)
     parser.add_argument("--gpu", type=int, default=0)

@@ -15,7 +15,7 @@ from fastwam.closed_loop_eval.benchmark import build_argparser, run
 from fastwam.closed_loop_eval.episode_recorder import to_jsonable
 
 
-DEFAULT_PROFILES = ("open_door_airbot_play_gs", "cup_on_coaster_gs_airbot_p7")
+DEFAULT_PROFILES = ("open_door_airbot_play_back_gs", "cup_on_coaster_gs_airbot_p7")
 
 
 def _build_benchmark_args(args: argparse.Namespace, profile: str) -> argparse.Namespace:

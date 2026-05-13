@@ -24,14 +24,12 @@ from fastwam.closed_loop_eval.episode_recorder import EpisodeRecorder, to_jsonab
 from fastwam.closed_loop_eval.model_clients import BaseModelClient, FastWAMModelClient, HoldModelClient
 from fastwam.closed_loop_eval.observation_adapter import AAOObservationAdapter, split_batched_observation
 from fastwam.closed_loop_eval.runner import (
-    DEFAULT_MIX_CKPT,
-    DEFAULT_MIX_CONFIG,
-    DEFAULT_MIX_STATS,
     _clamp_gripper,
     _continuous_hold_seconds,
     _control_metadata,
     _effective_sim_loop_frequency,
     _parse_camera_map,
+    _resolve_overrides,
     _resolve_control_mode,
     _validate_camera_map,
     _validated_actions,
@@ -63,6 +61,17 @@ DEFAULT_STRIDES = (32,)
 def _build_model_client(args: argparse.Namespace) -> BaseModelClient:
     if args.model_client == "hold":
         return HoldModelClient(horizon=args.action_horizon)
+    missing = [
+        name for name, value in (
+            ("--fastwam-config", args.fastwam_config),
+            ("--checkpoint", args.checkpoint),
+            ("--dataset-stats", args.dataset_stats),
+            ("--text-cache-dir", args.text_cache_dir),
+        )
+        if not value
+    ]
+    if missing:
+        raise ValueError(f"--model-client=fastwam requires {', '.join(missing)} to be set explicitly.")
     return FastWAMModelClient(
         config_path=args.fastwam_config,
         checkpoint_path=args.checkpoint,
@@ -91,7 +100,7 @@ def _open_door_overrides(args: argparse.Namespace, door: str, wall: str) -> list
     if missing:
         raise FileNotFoundError(f"Missing GS assets for {door}/{wall}: {missing}")
 
-    overrides = [
+    variant_overrides = [
         f"door_name={door}",
         f"wall_name={wall}",
         "inside_name=inside0",
@@ -99,8 +108,13 @@ def _open_door_overrides(args: argparse.Namespace, door: str, wall: str) -> list
         f"env.gaussian_render.body_gaussians.lock_gs_frame={lock_path}",
         "env.gaussian_render.background_transform_randomization.inside.y=[0.0,0.0]",
     ]
-    overrides.extend(args.override)
-    return overrides
+    variant_overrides.extend(args.override)
+    override_args = argparse.Namespace(
+        override=variant_overrides,
+        disable_arm_randomization=args.disable_arm_randomization,
+        disable_arm_eef_randomization=args.disable_arm_eef_randomization,
+    )
+    return _resolve_overrides(override_args)
 
 
 def _extract_mujoco_diagnostics(sim: SimulatorServiceClient) -> dict[str, Any]:
@@ -287,7 +301,7 @@ def _run_one(
                     _validated_actions(model_response, expected_format="cartesian_absolute", action_dim=7),
                     gripper_min=args.gripper_min,
                     gripper_max=args.gripper_max,
-                    gripper_index=-1,
+                    gripper_index=args.gripper_index,
                 )
                 remaining_updates = args.max_updates - updates_used
                 chunk_steps = min(
@@ -468,6 +482,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--action-horizon must be positive.")
     if args.max_updates <= 0:
         raise ValueError("--max-updates must be positive.")
+    if args.disable_arm_randomization is None:
+        args.disable_arm_randomization = str(args.task).startswith("open_door")
     output_root = Path(args.output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -538,9 +554,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aao-root", default=str(DEFAULT_AAO_ROOT))
-    parser.add_argument("--task", default="open_door_airbot_play_gs")
+    parser.add_argument("--task", default="open_door_airbot_play_back_gs")
     parser.add_argument("--override", action="append", default=[])
-    parser.add_argument("--output-dir", default="runs/aao_closed_loop/fastwam_mix20k_open_door_gs_30env_random_bg_sweep")
+    parser.add_argument(
+        "--disable-arm-eef-randomization",
+        action="store_true",
+        help="Force task.randomization.arm.eef.{x,y,z} to [0,0].",
+    )
+    parser.add_argument(
+        "--disable-arm-randomization",
+        action="store_true",
+        default=None,
+        help="Force task.randomization.arm.base/eef.{x,y,z} to [0,0]. Open-door tasks disable it by default.",
+    )
+    parser.add_argument(
+        "--enable-arm-randomization",
+        action="store_false",
+        dest="disable_arm_randomization",
+        help="Keep task.randomization.arm enabled.",
+    )
+    parser.add_argument("--output-dir", default="runs/aao_closed_loop/open_door_back_gs_30env_random_bg_sweep")
     parser.add_argument("--doors", default=",".join(DEFAULT_DOORS))
     parser.add_argument("--walls", default=",".join(DEFAULT_WALLS))
     parser.add_argument("--strides", default=",".join(str(item) for item in DEFAULT_STRIDES))
@@ -550,16 +583,18 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-updates", type=int, default=160)
     parser.add_argument("--action-repeat", type=int, default=5)
     parser.add_argument("--action-horizon", type=int, default=32)
+    parser.add_argument("--action-format", choices=("cartesian_absolute",), default="cartesian_absolute")
     parser.add_argument("--train-action-hz", type=float, default=20.0)
     parser.add_argument("--gripper-min", type=float, default=0.02)
     parser.add_argument("--gripper-max", type=float, default=0.0945)
+    parser.add_argument("--gripper-index", type=int, default=-1)
     parser.add_argument("--camera-map", default="head_left=env2_cam,right_wrist_left=eef_wrist_cam")
     parser.add_argument("--proprio-mode", choices=("cartesian", "joint"), default="joint")
     parser.add_argument("--model-client", choices=("hold", "fastwam"), default="fastwam")
-    parser.add_argument("--fastwam-config", default=str(DEFAULT_MIX_CONFIG))
-    parser.add_argument("--checkpoint", default=str(DEFAULT_MIX_CKPT))
-    parser.add_argument("--dataset-stats", default=str(DEFAULT_MIX_STATS))
-    parser.add_argument("--text-cache-dir", default="data/text_embeds_cache/mix")
+    parser.add_argument("--fastwam-config", default=None)
+    parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--dataset-stats", default=None)
+    parser.add_argument("--text-cache-dir", default=None)
     parser.add_argument("--instruction", default="open the door")
     parser.add_argument(
         "--model-action-mode",

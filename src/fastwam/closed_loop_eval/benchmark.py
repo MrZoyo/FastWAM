@@ -57,6 +57,7 @@ class BenchmarkProfile:
 
 
 DEFAULT_PROFILE_FILES: dict[str, Path] = {
+    "open_door_airbot_play_back_gs": _DEFAULT_PROFILE_DIR / "open_door_airbot_play_back_gs.yaml",
     "open_door_airbot_play_gs": _DEFAULT_PROFILE_DIR / "open_door_airbot_play_gs.yaml",
     "cup_on_coaster_gs_airbot_p7": _DEFAULT_PROFILE_DIR / "cup_on_coaster_gs_airbot_p7.yaml",
 }
@@ -216,16 +217,7 @@ def _build_model_client(args: argparse.Namespace, profile: BenchmarkProfile) -> 
         if _parse_model_gpus(args.model_gpus):
             raise ValueError("--model-gpus only applies to --model-client fastwam.")
         return HoldModelClient(horizon=args.action_horizon)
-    missing: list[str] = []
-    if not profile.fastwam_config:
-        missing.append("--fastwam-config")
-    if not args.checkpoint:
-        missing.append("--checkpoint")
-    if not args.dataset_stats:
-        missing.append("--dataset-stats")
-    if missing:
-        joined = ", ".join(missing)
-        raise ValueError(f"model-client=fastwam requires {joined}; checkpoint paths are intentionally not hard-coded.")
+    _validate_fastwam_paths(args, profile)
     client_kwargs = {
         "config_path": profile.fastwam_config,
         "checkpoint_path": args.checkpoint,
@@ -250,6 +242,23 @@ def _build_model_client(args: argparse.Namespace, profile: BenchmarkProfile) -> 
         worker_start_method=args.model_worker_start_method,
         **client_kwargs,
     )
+
+
+def _validate_fastwam_paths(args: argparse.Namespace, profile: BenchmarkProfile) -> None:
+    if args.model_client != "fastwam":
+        return
+    missing: list[str] = []
+    if not profile.fastwam_config:
+        missing.append("--fastwam-config")
+    if not args.checkpoint:
+        missing.append("--checkpoint")
+    if not args.dataset_stats:
+        missing.append("--dataset-stats")
+    if not profile.text_cache_dir:
+        missing.append("--text-cache-dir")
+    if missing:
+        joined = ", ".join(missing)
+        raise ValueError(f"model-client=fastwam requires {joined}; checkpoint paths are intentionally not hard-coded.")
 
 
 def _validate_model_client(profile: BenchmarkProfile, model_client: BaseModelClient) -> None:
@@ -766,6 +775,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     args.proprio_dim = profile.proprio_dim
     args.fastwam_config = profile.fastwam_config
     args.text_cache_dir = profile.text_cache_dir
+    _validate_fastwam_paths(args, profile)
     output_root = Path(args.output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     for stale_name in ("benchmark_results.jsonl", "benchmark_results.csv", "benchmark_summary.json"):
@@ -1048,7 +1058,7 @@ def _build_payload(
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aao-root", default=str(DEFAULT_AAO_ROOT))
-    parser.add_argument("--profile", choices=_profile_names(), default="open_door_airbot_play_gs")
+    parser.add_argument("--profile", choices=_profile_names(), default="open_door_airbot_play_back_gs")
     parser.add_argument(
         "--profile-config",
         default=None,

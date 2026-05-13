@@ -1,5 +1,5 @@
-name: open_door_airbot_play_gs
-task: open_door_airbot_play_gs
+name: open_door_airbot_play_back_gs
+task: open_door_airbot_play_back_gs
 instruction: open the door
 camera_map: head_left=env2_cam,right_wrist_left=eef_wrist_cam
 action_repeat: 5

@@ -6,6 +6,11 @@
 
 ## 当前事实
 
+- 当前代码的最新使用说明以 `README.md` 和 `docs/aao_benchmark.md` 为准：
+  open-door 默认任务是 `open_door_airbot_play_back_gs`，对应门把手在左侧的
+  back 版本；FastWAM checkpoint/config/stats/text cache 必须通过 CLI 显式
+  指定；open-door 默认 `stride=32`，并默认关闭 arm base/EEF reset
+  randomization。
 - `WorldModel_3d` 已同步到 `a08e872`，闭环入口在 `closed_loop_eval/run_closed_loop_eval.py`。
 - `WorldModel_3d` 使用 `auto-atomic-operation` 作为仓库内 submodule，而不是外部软链接。
 - `WorldModel_3d/auto-atomic-operation` 最初参考 pin 为 `2f7a10b`；FastWAM 侧需要使用更新的 AAO open door/Airbot/GS 配置。
@@ -14,21 +19,23 @@
 - FastWAM 已新增 `third_party/GaussianRenderer` submodule，跟踪 `main`，当前 pin 到 `8eb95dd690626bdece989b6f1b2cad10371ce652`，用于 AAO GS open door。
 - FastWAM 已新增进程内 AAO 集成层，不依赖 WorldModel 风格的 WebSocket inference server。
 - FastWAM 的模型动作输出在模型归一化空间内，需要使用训练时 `FastWAMProcessor` 的 normalizer 做反归一化后再送给仿真器。
-- 可用于第一轮测试的既有 mix 20k 权重：
-  - checkpoint: `/DATA/disk1/zoyo/FastWAM/runs/mix_uncond_2cam224_1e-4/mix_uncond_20k_20260507_024400/checkpoints/weights/step_020000.pt`
-  - config: `/DATA/disk1/zoyo/FastWAM/runs/mix_uncond_2cam224_1e-4/mix_uncond_20k_20260507_024400/config.yaml`
-  - stats: `/DATA/disk1/zoyo/FastWAM/runs/mix_uncond_2cam224_1e-4/mix_uncond_20k_20260507_024400/dataset_stats.json`
-- Lyle 侧当前 real_1048 训练 run 为 `/DATA/disk7/Lyle/FastWAM/runs/real_1048_uncond_2cam224_1e-4/real1048_20k_20260508_200316`，配置和 `dataset_stats.json` 已生成，但截至 2026-05-08 20:10 CST 尚未产出 checkpoint。
-- mix 20k 配置训练动作窗口为 `num_frames - 1 = 32` 个 action；`/home/zoyo/mix/meta/info.json` 的数据 FPS 是 `20`。
+- 当前 open-door 模型评测使用显式传入的 run 资产；代码不再内置任何
+  checkpoint/config/stats/text-cache 路径。示例见 `README.md` 和
+  `docs/aao_benchmark.md`。
+- 当前 real+sim open-door 配置训练动作窗口为 `num_frames - 1 = 32` 个
+  action；本地 LeRobot 数据 FPS 是 `20`。
 - AAO `open_door_airbot_play_gs` 继承的 `env.update_freq` 是 `100`，因此数据中 1 个 20Hz action 在 AAO 中应保持 `5` 个 update。
-- 当前闭环代码默认 `action_horizon=32`、`action_repeat=5`、单 episode 默认 `stride=8`，sweep 默认测试 `stride=4,8`。
+- 历史记录：2026-05-08 初始闭环代码曾默认 `stride=8`，sweep 默认测试
+  `stride=4,8`。当前代码已经改为 open-door 默认 `stride=32`。
 - 控制模式不再暴露单独 `control-mode` 参数，只由 `--sim-loop-frequency` 控制：`0` 为同步 lockstep，`>0` 为 AAO 后台持续仿真 continuous。
 
 ## 2026-05-08 新闭环控制设计
 
 - 每次用最新 AAO observation 做一次 FastWAM 推理，得到未来一个 action chunk。
-- 当前 checkpoint 训练窗口是 32 个 action；若后续要严格按 1 秒窗口验证，可把 `--action-horizon` 设为 `20`，但第一轮优先保持训练窗口 `32`。
-- 每次只执行 chunk 前 `stride` 个模型 action，当前重点比较 `stride=4` 和 `stride=8`。
+- 当前 open-door checkpoint 训练窗口是 32 个 action，默认保持
+  `action_horizon=32`。
+- 默认执行完整 32-action chunk 后再重新规划，即 `stride=32`。较小 stride
+  只作为 receding-horizon 诊断参数，不作为当前 open-door 正式评测默认值。
 - 每个模型 action 在 AAO 中重复执行 `action_repeat=5` 个 update，把 20Hz 训练 action 对齐到 100Hz AAO update。
 - 每个 chunk 执行完后重新读取 AAO 最新 observation，再做下一次 FastWAM 推理。
 - `--sim-loop-frequency 0` 使用同步 lockstep：每个 action 通过 AAO `update(action)` 推进一步，然后读取 observation。
@@ -62,15 +69,22 @@ WorldModel 的闭环结构可以直接借鉴：
 ## FastWAM 需要适配的关键差异
 
 - 输入：FastWAM `infer_action` 需要单张拼接后的首帧图像 `[1, 3, H, W]`、prompt 或 cached text context、可选 proprio。
-- 图像：real_1048 训练配置是双相机水平拼接，最终 `video_size=[224,448]`；AAO 应映射两路相机到 FastWAM 训练相机：
+- 图像：当前 open-door 训练配置是双相机水平拼接，最终
+  `video_size=[224,448]`；AAO 应映射两路相机到 FastWAM 训练相机：
   - 当前默认：`env2_cam -> head_left`
   - 当前默认：`eef_wrist_cam -> right_wrist_left`
-- 状态：real_1048/mix 训练 state/action 是 7 维。AAO observation 提供的是 EEF pose 和 gripper；当前按以下语义适配：
+- 状态：当前 open-door 训练 `observation.state` 是 6D arm joint + gripper，
+  action 是 7D EEF delta + gripper。AAO observation 同时提供 joint state、
+  EEF pose 和 gripper；当前按以下语义适配：
   - 训练动作名：`delta_x, delta_y, delta_z, delta_roll, delta_pitch, delta_yaw, right_gripper_position`
   - AAO apply 期望：`cartesian_absolute`，即绝对 `[x, y, z, r, p, y, gripper]`
   - 当前 LeRobot action 的前 6 维是帧对齐 backward delta：`pose[t] - pose[t-1]`，不是 `pose[t+1] - pose[t]`。AAO bridge 下发前会先把 action chunk 左移一帧，再累计积分到当前 EEF pose；最后 1 维 gripper length 不是 delta，只做同样的一帧时间对齐并按 absolute 值传给 AAO。
-- 文本：real_1048 instruction 是 `open the door`，已有 text embedding cache 路径候选为 `data/text_embeds_cache/real_1048/...pt`。
-- 权重：优先用 mix 20k 的 `step_020000.pt` 进行第一轮闭环集成测试；real_1048 当前训练产物等 checkpoint 生成后再切换。
+- 文本：open-door instruction 是 `open the door`，text embedding cache 必须由
+  `--text-cache-dir` 显式传入。
+- 权重：不再有默认权重。闭环 runner、benchmark、visual rollout 和 sweep 在
+  `--model-client fastwam` 下都要求显式传
+  `--fastwam-config`、`--checkpoint`、`--dataset-stats` 和
+  `--text-cache-dir`。
 
 ## 执行阶段
 
@@ -89,7 +103,9 @@ WorldModel 的闭环结构可以直接借鉴：
    - 用最新 AAO 的 open door config 做 `PolicyEvaluator` 初始化和 reset。
    - 先用 hold/mock policy 跑最小 episode，确认 observation、camera、EEF state、stage success、summary 可用。
    - 记录可用 task config 名称，候选为 `open_door`、`open_door_airbot_play_gs`、`open_door_airbot_play_g2p`。
-   - 默认使用 `open_door_airbot_play_gs` 做 smoke test 和闭环验证，贴近 open door 的 GS 仿真版本。
+   - 历史记录：初始 smoke test 使用 `open_door_airbot_play_gs` 做闭环验证，贴近
+     open door 的 GS 仿真版本；当前默认已切到
+     `open_door_airbot_play_back_gs`。
 
 4. FastWAM inference client
    - 新增 FastWAM 专用 closed-loop model client。
@@ -106,7 +122,9 @@ WorldModel 的闭环结构可以直接借鉴：
 6. 视觉对比 rollout
    - 新增 `scripts/run_aao_visual_rollout.py`，用于输出 pred / VAE recon / actual simulator 的 3x2 拼接视频。
    - `--frame-sampling model-action` 每个模型 action 输出一帧；`--frame-sampling sim-update` 每个 AAO update 输出一帧。
-   - mix 20k 配置下 `action_horizon=32, num_video_frames=9`，pred/recon 每个 window 只有 9 个视频帧；sim-update 模式按最近邻展开到每个 AAO update。
+   - 当前 open-door 配置下 `action_horizon=32, num_video_frames=9`，
+     pred/recon 每个 window 只有 9 个视频帧；sim-update 模式按最近邻展开到
+     每个 AAO update。
 
 7. 验证顺序
    - 只初始化 simulator，不跑模型。
@@ -124,10 +142,13 @@ WorldModel 的闭环结构可以直接借鉴：
 
 ## 当前未决问题
 
-- real_1048 权重的确切路径。mix 20k 测试权重路径已确认。
-- real_1048 权重对应的 data config、dataset stats、text embedding cache 是否完整。当前 real_1048 run 的 config/stats/cache 可用，但 checkpoint 尚未生成。
+- 当前要评测的 open-door 权重、data config、dataset stats、text embedding
+  cache 路径必须在命令行显式指定，且 stats/cache 必须与 checkpoint 的训练 run
+  匹配。
 - gripper length 与 AAO `FingerDistanceMapper` 的几何标定是否完全一致仍需通过视频和 trace 继续验证；若不一致，加入显式 length mapping，而不是改成“开合度”语义。
-- AAO open door 默认使用 `open_door_airbot_play_gs`，普通 MuJoCo/G2P 版本 `open_door_airbot_play_g2p` 作为依赖排查时的降级验证。
+- 当前 AAO open door 默认使用 `open_door_airbot_play_back_gs`；front 对照可显式
+  传 `open_door_airbot_play_gs`，普通 MuJoCo/G2P 版本
+  `open_door_airbot_play_g2p` 作为依赖排查时的降级验证。
 - AAO/GS 部署方式已写入 README/README_zh：包括 submodule、AAO/GaussianRenderer 本地安装、AAO Git LFS mesh、HF open-door GS assets 下载。
 
 ## 暂不做

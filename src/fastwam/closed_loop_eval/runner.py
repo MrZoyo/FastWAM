@@ -278,6 +278,7 @@ def _build_model_client(args: argparse.Namespace) -> BaseModelClient:
                 ("--fastwam-config", args.fastwam_config),
                 ("--checkpoint", args.checkpoint),
                 ("--dataset-stats", args.dataset_stats),
+                ("--text-cache-dir", args.text_cache_dir),
             )
             if not value
         ]
@@ -540,7 +541,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--aao-root", default=str(DEFAULT_AAO_ROOT))
-    parser.add_argument("--task", default="open_door_airbot_play_gs")
+    parser.add_argument("--task", default="open_door_airbot_play_back_gs")
     parser.add_argument("--override", action="append", default=[])
     parser.add_argument(
         "--disable-arm-eef-randomization",
@@ -563,7 +564,7 @@ def build_argparser() -> argparse.ArgumentParser:
         dest="disable_arm_randomization",
         help="Keep task.randomization.arm enabled. Open-door tasks disable it by default.",
     )
-    parser.add_argument("--output-dir", default="runs/aao_closed_loop/open_door_airbot_play_gs")
+    parser.add_argument("--output-dir", default="runs/aao_closed_loop/open_door_airbot_play_back_gs")
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max-updates", type=int, default=40)
     parser.add_argument("--stride", type=int, default=32)
@@ -584,7 +585,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-stats", default=None,
         help="Required when --model-client=fastwam. Path to the dataset_stats.json paired with the checkpoint; "
              "different runs/datasets have different normalization stats, do not rely on a fallback.")
-    parser.add_argument("--text-cache-dir", default="data/text_embeds_cache/mix")
+    parser.add_argument("--text-cache-dir", default=None)
     parser.add_argument("--instruction", default="open the door")
     parser.add_argument(
         "--model-action-mode",

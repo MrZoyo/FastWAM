@@ -1,5 +1,17 @@
 # Auto Atomic Open Door Closed-Loop Progress
 
+## 当前状态
+
+- 最新使用说明以 `README.md` 和 `docs/aao_benchmark.md` 为准。
+- open-door 默认任务已改为 `open_door_airbot_play_back_gs`，对应门把手在左侧的
+  back 版本；`open_door_airbot_play_gs` 仅作为 front/right-handle 对照场景显式使用。
+- `runner.py`、benchmark、visual rollout、sweep 和 replay 脚本不再隐式指定
+  FastWAM checkpoint；使用 `--model-client fastwam` 时必须显式传入
+  `--fastwam-config`、`--checkpoint`、`--dataset-stats` 和对应的
+  `--text-cache-dir`。
+- open-door 默认 `stride=32`、`action_repeat=5`、`proprio_mode=joint`，并默认关闭
+  AAO arm base/EEF reset randomization，除非显式传 `--enable-arm-randomization`。
+
 ## 2026-05-08
 
 ### 已完成
@@ -70,7 +82,9 @@
 - 第一版 FastWAM 闭环代码采用可配置 `--aao-root`，默认使用 FastWAM 自己的 `third_party/auto-atomic-operation`。
 - 运行 smoke test 时使用 AAO 上游 `origin/main` 版本 `f12f75c`，因为 WorldModel 当前 pin `2f7a10b` 缺少多项 open door/Airbot/GS 修复。
 - 先用 mix 20k 实现和验证 FastWAM model client；real_1048 checkpoint 产出后只需要替换 config/stats/checkpoint/text cache。
-- 用户要求默认使用 GS 版本 open door，因此默认 AAO task 改为 `open_door_airbot_play_gs`。
+- 历史记录：当时用户要求默认使用 GS 版本 open door，因此默认 AAO task 曾改为
+  `open_door_airbot_play_gs`；当前默认已改为
+  `open_door_airbot_play_back_gs`，对应门把手在左侧的 back 版本。
 - 最新 Airbot/G2P open door 配置暴露的相机是 `env2_cam` 和 `eef_wrist_cam`，默认 FastWAM 相机映射改为 `head_left=env2_cam,right_wrist_left=eef_wrist_cam`。
 - 按用户确认已直接补齐当前 `.venv` 的 GS 依赖：
   - `gaussian-renderer==0.2.0` editable from `third_party/GaussianRenderer`
@@ -161,8 +175,9 @@
   - AAO replay 配置里对 `eef_claw_joint` 有 `min: 0.02`，用于避免夹爪闭到 0 穿过门把手；闭环 runner/sweep 已加 `--gripper-min 0.02 --gripper-max 0.0945`，默认启用。
   - `smoke_fastwam_repeat5_gripper_clamp` 通过：`stride=8, action_repeat=5, max_updates=40` 下，实际喂给 AAO 的 gripper 为 `0.0893..0.0927`，没有立刻闭合。
 - 新闭环设计已同步到代码：
-  - 单 episode runner 默认改为 `stride=8, action_repeat=5, action_horizon=32`。
-  - sweep 默认改为 `stride=4,8`，不再默认跑旧的 `stride=16`。
+  - 历史记录：单 episode runner 曾默认改为
+    `stride=8, action_repeat=5, action_horizon=32`，sweep 曾默认测试
+    `stride=4,8`。当前 open-door 默认已改为 `stride=32`。
   - 每次推理后只执行前 `stride` 个模型 action；每个模型 action 在 AAO 中 repeat `5` 个 update；chunk 执行结束后用最新 observation 重新推理。
   - `client_trace.json.gz` 每步新增 `chunk_action_index` 和 `repeat_index`，避免把模型 action index 和仿真 repeat index 混在一起。
   - 单 episode runner 和 sweep 都在 metadata/aggregate 中记录 `action_horizon`、`stride_model_actions`、`action_repeat_sim_updates`、`train_action_hz`、`aao_update_hz`、`effective_action_hz_in_sim`、`gripper_min/max`。
@@ -234,14 +249,18 @@
   - command: `.venv/bin/python -B scripts/run_aao_open_door_gs_sweep.py --gpu 3 --device cuda:0 --output-dir runs/aao_closed_loop/fastwam_mix20k_open_door_gs_30env_repeat5_lockstep_20260508 --num-combos 30 --strides 4,8 --max-updates 160 --action-repeat 5 --action-horizon 32 --num-inference-steps 10 --sim-loop-frequency 0 --log-level INFO`
   - 因 GPU 资源过满，用户要求先停止；已终止 PID `1647397`。
   - 该目录只包含部分已完成 episode，不作为完整 30 环境结果使用。
-- README 顶部已新增 AAO open-door closed-loop integration 总说明，记录入口脚本、默认权重、`--sim-loop-frequency` 语义、默认时间尺度和成功判据注意事项。
+- README 顶部已新增 AAO open-door closed-loop integration 总说明，记录入口脚本、
+  显式模型路径要求、`--sim-loop-frequency` 语义、默认时间尺度和成功判据注意事项。
 - README/README_zh 已同步部署说明：
   - fresh clone 使用 `git clone --recurse-submodules`，未递归 clone 时用 `git submodule update --init --recursive`。
   - AAO 从本地 `third_party/auto-atomic-operation[mujoco]` 安装，GaussianRenderer 从本地 `third_party/GaussianRenderer[shs,mujoco]` 安装，避免重新拉浮动 Git 依赖。
   - AAO MuJoCo mesh 需要在 submodule 内执行 `git lfs pull --include "assets/meshes/**" --exclude "assets/videos/**"`。
   - open-door GS `.ply` 资产需要从 HF dataset `OpenGHz/auto-atom-assets` 下载到 `third_party/auto-atomic-operation`，README 中的 `--include` 已改为 `assets/gs/...` 路径，确保落盘为 `third_party/auto-atomic-operation/assets/gs/...`。
   - `runs/` 下的 mix 20k 模型产物不会提交，README 已说明需要单独复制/下载 `config.yaml`、`dataset_stats.json`、text embedding cache 和 checkpoint，或用 CLI 参数显式指定其他 run。
-- 代码默认 mix 20k 路径已从本机绝对路径改为仓库根目录下的相对路径，避免其他用户 clone 后默认参数仍指向 `/DATA/disk1/zoyo/FastWAM/...`。
+- 历史记录：代码曾默认使用仓库根目录下的 mix 20k 相对路径。当前
+  runner/benchmark/visual/sweep 都不再隐式指定 checkpoint；FastWAM 模型评测必须
+  显式传 `--fastwam-config`、`--checkpoint`、`--dataset-stats` 和
+  `--text-cache-dir`。
 - `.gitignore` 已补充 `.hf_cache/`、`.local/`、`data.local_before_origin_main_*/`，避免本地缓存和远端同步前备份目录误提交。
 
 ## 2026-05-11
@@ -282,16 +301,20 @@
 
 - open door FastWAM checkpoint 的准确路径。
 - 是否需要同步 AAO 的 LFS/大文件资产；如果 smoke test 提示 mesh/ply/xml 资产缺失，需要补充 `git lfs pull`。
-- open door 仿真任务默认使用 `open_door_airbot_play_gs`。
+- open door 仿真任务当前默认使用 `open_door_airbot_play_back_gs`；front 对照显式
+  使用 `open_door_airbot_play_gs`。
 - 若 GS 依赖或资产缺失，临时降级排查可用 `open_door_airbot_play_g2p`。
 
 ### 下一步
 
-1. 等 GPU 空闲后再恢复 30 环境 sweep，并重新生成 stride 4 / stride 8 两个长视频。
-2. 单环境下 `stride=4/8` 仍没有真实开门，后续继续排查动作坐标、相机域差异和 gripper length 标定。
-3. 重点检查第二个 chunk 后 gripper 从约 `0.09` 快速降到 `0.02` 的行为是否符合训练数据；如果 AAO finger distance 与训练 length 不同，加入显式 gripper length mapping。
-4. 对 `stride=8` 的 AAO success 假阳性，继续用 `mujoco_diagnostics` 的 door/handle hinge delta 和视频末帧作为主判据。
-5. 当前 real_1048 训练到第一个可用 checkpoint 后，把 `--fastwam-config/--checkpoint/--dataset-stats/--text-cache-dir` 切到 real_1048 run，并用视频 + 物理状态 trace 共同判定。
+1. 后续 open-door 正式闭环/benchmark 默认使用
+   `open_door_airbot_play_back_gs`、`stride=32`、`action_repeat=5`、joint
+   proprio、关闭 arm randomization，并显式传入
+   `--fastwam-config/--checkpoint/--dataset-stats/--text-cache-dir`。
+2. 继续用 `mujoco_diagnostics` 的 door/handle hinge delta 和视频末帧作为主判据；
+   不再只依赖 AAO `final_success`。
+3. 如果 `stride=32` 下仍不能稳定真实开门，优先排查坐标系、相机域差异和
+   gripper length 标定；较小 stride 仅作为 receding-horizon 诊断参数。
 
 ## 2026-05-13
 
@@ -314,6 +337,9 @@
   增加约 `0.053 rad`。
 - 已用 mix 20k ckpt 跑 3 个 open-door AAO episode，视频在
   `runs/aao_closed_loop/mix20k_open_door_gs_3ep_20260513_actionfix/`。
+- 之后的正式 open-door 运行已改为使用 real+sim open-door 20k run，并要求
+  显式传入 config、checkpoint、dataset stats 和 text cache；mix 20k 路径不再是
+  任何脚本默认值。
 
 ### 注意
 

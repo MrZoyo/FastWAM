@@ -14,14 +14,15 @@ benchmark 的任务默认值已经抽到 YAML：
 
 | profile | YAML | AAO task | 模型输入 state | 模型输出 action | 相机映射 |
 | --- | --- | --- | --- | --- | --- |
-| `open_door_airbot_play_gs` | `configs/aao_benchmark/open_door_airbot_play_gs.yaml` | `open_door_airbot_play_gs` | 7D joint + gripper | 7D EEF pose + gripper | `head_left=env2_cam,right_wrist_left=eef_wrist_cam` |
+| `open_door_airbot_play_back_gs` | `configs/aao_benchmark/open_door_airbot_play_back_gs.yaml` | `open_door_airbot_play_back_gs` | 6D arm joint + gripper | 7D EEF pose + gripper | `head_left=env2_cam,right_wrist_left=eef_wrist_cam` |
+| `open_door_airbot_play_gs` | `configs/aao_benchmark/open_door_airbot_play_gs.yaml` | `open_door_airbot_play_gs` | 6D arm joint + gripper | 7D EEF pose + gripper | `head_left=env2_cam,right_wrist_left=eef_wrist_cam` |
 | `cup_on_coaster_gs_airbot_p7` | `configs/aao_benchmark/cup_on_coaster_gs_airbot_p7.yaml` | `cup_on_coaster_gs_airbot_p7` | 8D joint + gripper | 7D EEF pose + gripper | `head_left=env1_cam,right_wrist_left=eef_wrist_cam` |
 
 可以继续用内置名字：
 
 ```bash
 .venv/bin/python scripts/run_aao_benchmark.py \
-  --profile open_door_airbot_play_gs \
+  --profile open_door_airbot_play_back_gs \
   ...
 ```
 
@@ -29,15 +30,15 @@ benchmark 的任务默认值已经抽到 YAML：
 
 ```bash
 .venv/bin/python scripts/run_aao_benchmark.py \
-  --profile-config configs/aao_benchmark/open_door_airbot_play_gs.yaml \
+  --profile-config configs/aao_benchmark/open_door_airbot_play_back_gs.yaml \
   ...
 ```
 
 YAML 字段示例：
 
 ```yaml
-name: open_door_airbot_play_gs
-task: open_door_airbot_play_gs
+name: open_door_airbot_play_back_gs
+task: open_door_airbot_play_back_gs
 instruction: open the door
 camera_map: head_left=env2_cam,right_wrist_left=eef_wrist_cam
 action_repeat: 5
@@ -47,12 +48,14 @@ stride: 32
 disable_arm_randomization: true
 proprio_mode: joint
 proprio_dim: 7
-fastwam_config: configs/task/mix_uncond_2cam224_1e-4.yaml
-text_cache_dir: data/text_embeds_cache/mix
 ```
 
 注意：
 
+- open door 的默认 profile 是 `open_door_airbot_play_back_gs`，也就是门把手在
+  左侧的 back 版本；这和当前本地 real+sim open-door 训练/回放数据一致。
+  `open_door_airbot_play_gs` 是 front/right-handle 版本，只在需要对照测试时
+  显式指定。
 - benchmark 统一向 AAO 下发 `cartesian_absolute`。AAO 的
   `apply_pose_action()` 期望的是绝对 EEF 目标位姿，不是相对量。
 - 不支持 `joint_absolute` 控制；open door 和 cup 都只把 joint + gripper
@@ -88,8 +91,9 @@ text_cache_dir: data/text_embeds_cache/mix
 - cup 只使用 `cup_on_coaster_gs_airbot_p7`。不要把 cup profile 的 `task` 覆盖成
   `cup_on_coaster_airbot_p7_umi` 或其他 UMI v3 场景；这些场景没有作为 FastWAM
   cup benchmark 的有效目标。
-- `fastwam_config` 和 `text_cache_dir` 在 YAML 中可以写仓库相对路径。
-- `checkpoint` 和 `dataset_stats` 不写进 profile，正式模型评测时必须显式传入。
+- `fastwam_config`、`checkpoint`、`dataset_stats` 和 `text_cache_dir` 不写进
+  默认 profile。正式模型评测时必须显式传入这些路径；`dataset_stats.json`
+  必须和 checkpoint 的训练数据匹配。
 - 默认会关闭 depth、mask、heat map，只取 RGB，避免 GS segmentation 相关崩溃并减少开销。
 
 ## Strict 校验
@@ -135,13 +139,13 @@ cd /DATA/disk1/zoyo/FastWAM
 ```
 
 确认 AAO/GS 依赖已经按 README 的 AAO 部署步骤装好。正式模型评测还需要确认
-checkpoint、dataset stats 和 text cache 存在：
+checkpoint、dataset stats、config 和 text cache 存在：
 
 ```bash
+ls -lh "$FASTWAM_CONFIG"
 ls -lh "$CHECKPOINT"
 ls -lh "$DATASET_STATS"
-ls -lh data/text_embeds_cache/mix
-ls -lh data/text_embeds_cache/cup
+ls -ld "$TEXT_CACHE_DIR"
 ```
 
 `dataset_stats.json` 用于把 AAO observation 转成训练分布里的归一化 state，
@@ -152,9 +156,10 @@ ls -lh data/text_embeds_cache/cup
 MCAP decoder 依赖：`mcap` 和 `mcap-ros2idl-support`。缺少这些包时，AAO
 DataReplay 无法从源 MCAP 初始化首帧 joint 和 transform reset。
 
-text cache 必须和 profile 的 instruction 一致：
+text cache 必须和 profile 的 instruction 一致，并通过 `--text-cache-dir`
+显式传入：
 
-- mix/open door：`open the door`
+- open door：`open the door`
 - cup：`pick up the cup and place it on the coaster`
 
 如果缺 text cache，模型 worker 会在初始化时报 `Missing text embedding cache`。
@@ -173,7 +178,7 @@ text cache 必须和 profile 的 instruction 一致：
 
 ```bash
 .venv/bin/python scripts/run_aao_benchmark_smoke_tests.py \
-  --profile open_door_airbot_play_gs \
+  --profile open_door_airbot_play_back_gs \
   --gpu 0
 ```
 
@@ -181,7 +186,7 @@ text cache 必须和 profile 的 instruction 一致：
 
 ```bash
 .venv/bin/python scripts/run_aao_benchmark.py \
-  --profile-config configs/aao_benchmark/open_door_airbot_play_gs.yaml \
+  --profile-config configs/aao_benchmark/open_door_airbot_play_back_gs.yaml \
   --model-client hold \
   --gpu 0 \
   --batch-size 1 \
@@ -202,28 +207,33 @@ smoke 常用 `--max-updates 1`，因此 `success_rate=0.0` 是正常现象；
 .venv/bin/python -m pytest -q tests/test_aao_benchmark_strict.py
 ```
 
-## mix 开门模型测试
+## open-door 模型测试
 
-本地已验证过的 mix run 示例：
+当前本地 open-door 训练数据对应 back/左门把手版本。正式测试时显式指定
+checkpoint、dataset stats、config 和 text cache：
 
 ```bash
-MIX_CKPT=runs/mix_uncond_2cam224_1e-4/mix_uncond_20k_20260507_024400/checkpoints/weights/step_020000.pt
-MIX_STATS=runs/mix_uncond_2cam224_1e-4/mix_uncond_20k_20260507_024400/dataset_stats.json
+OPEN_DOOR_CONFIG=configs/task/real_sim_open_door_uncond_2cam224_1e-4_20k.yaml
+OPEN_DOOR_CKPT=runs/real_sim_open_door_uncond_2cam224_1e-4_20k/2026-05-13_03-21-04/checkpoints/weights/step_020000.pt
+OPEN_DOOR_STATS=runs/real_sim_open_door_uncond_2cam224_1e-4_20k/2026-05-13_03-21-04/dataset_stats.json
+OPEN_DOOR_TEXT_CACHE=data/text_embeds_cache/real_sim_open_door
 
 .venv/bin/python scripts/run_aao_benchmark.py \
-  --profile-config configs/aao_benchmark/open_door_airbot_play_gs.yaml \
+  --profile open_door_airbot_play_back_gs \
   --model-client fastwam \
   --model-gpus 1,7 \
   --gpu 0 \
-  --checkpoint "$MIX_CKPT" \
-  --dataset-stats "$MIX_STATS" \
+  --fastwam-config "$OPEN_DOOR_CONFIG" \
+  --checkpoint "$OPEN_DOOR_CKPT" \
+  --dataset-stats "$OPEN_DOOR_STATS" \
+  --text-cache-dir "$OPEN_DOOR_TEXT_CACHE" \
   --batch-size 2 \
   --total-episodes 2 \
   --max-updates 1 \
   --stride 1 \
   --action-horizon 32 \
   --num-inference-steps 1 \
-  --output-dir /DATA/disk3/tmp/fastwam_aao_benchmark_smoke_mix_parallel \
+  --output-dir /DATA/disk3/tmp/fastwam_aao_benchmark_smoke_open_door_parallel \
   --log-level INFO
 ```
 
@@ -232,17 +242,19 @@ MIX_STATS=runs/mix_uncond_2cam224_1e-4/mix_uncond_20k_20260507_024400/dataset_st
 
 ```bash
 .venv/bin/python scripts/run_aao_benchmark.py \
-  --profile-config configs/aao_benchmark/open_door_airbot_play_gs.yaml \
+  --profile open_door_airbot_play_back_gs \
   --model-client fastwam \
   --model-gpus 1,7 \
   --gpu 0 \
-  --checkpoint "$MIX_CKPT" \
-  --dataset-stats "$MIX_STATS" \
+  --fastwam-config "$OPEN_DOOR_CONFIG" \
+  --checkpoint "$OPEN_DOOR_CKPT" \
+  --dataset-stats "$OPEN_DOOR_STATS" \
+  --text-cache-dir "$OPEN_DOOR_TEXT_CACHE" \
   --batch-size 8 \
   --total-episodes 100 \
   --action-horizon 32 \
   --num-inference-steps 10 \
-  --output-dir runs/aao_benchmark/mix_open_door_gs_b8_e100
+  --output-dir runs/aao_benchmark/real_sim_open_door_back_gs_b8_e100
 ```
 
 open-door profile 的默认 `action_repeat=5`，用于把 20Hz 训练 action 对齐到
@@ -259,15 +271,19 @@ cup 测试只针对 `cup_on_coaster_gs_airbot_p7`。不要额外传
 
 ```bash
 CUP_CKPT=/DATA/disk1/zoyo/checkpoints/fastwam/cup_20k_resume5000_20260512_112808/weights/step_020000.pt
+CUP_CONFIG=configs/task/cup_uncond_2cam224_1e-4.yaml
 CUP_STATS=/DATA/disk1/zoyo/checkpoints/fastwam/cup_20k_resume5000_20260512_112808/dataset_stats.json
+CUP_TEXT_CACHE=data/text_embeds_cache/cup
 
 .venv/bin/python scripts/run_aao_benchmark.py \
   --profile-config configs/aao_benchmark/cup_on_coaster_gs_airbot_p7.yaml \
   --model-client fastwam \
   --model-gpus 1,7 \
   --gpu 0 \
+  --fastwam-config "$CUP_CONFIG" \
   --checkpoint "$CUP_CKPT" \
   --dataset-stats "$CUP_STATS" \
+  --text-cache-dir "$CUP_TEXT_CACHE" \
   --batch-size 2 \
   --total-episodes 2 \
   --max-updates 1 \
@@ -286,8 +302,10 @@ CUP_STATS=/DATA/disk1/zoyo/checkpoints/fastwam/cup_20k_resume5000_20260512_11280
   --model-client fastwam \
   --model-gpus 1,7 \
   --gpu 0 \
+  --fastwam-config "$CUP_CONFIG" \
   --checkpoint "$CUP_CKPT" \
   --dataset-stats "$CUP_STATS" \
+  --text-cache-dir "$CUP_TEXT_CACHE" \
   --batch-size 8 \
   --total-episodes 100 \
   --stride 8 \
@@ -427,7 +445,7 @@ enable_heat_map=false
 
 以下链路已经跑通过：
 
-- hold/open door：`--profile-config configs/aao_benchmark/open_door_airbot_play_gs.yaml --model-client hold --batch-size 1 --total-episodes 1 --max-updates 1`
+- hold/open door：`--profile open_door_airbot_play_back_gs --model-client hold --batch-size 1 --total-episodes 1 --max-updates 1`
 - hold/cup：`--profile-config configs/aao_benchmark/cup_on_coaster_gs_airbot_p7.yaml --model-client hold --batch-size 1 --total-episodes 1 --max-updates 1`
-- YAML profile/open door：显式 `--profile-config configs/aao_benchmark/open_door_airbot_play_gs.yaml` 的真实 AAO hold smoke。
+- YAML profile/open door：显式 `--profile-config configs/aao_benchmark/open_door_airbot_play_back_gs.yaml` 的真实 AAO hold smoke。
 - strict 单元测试：`.venv/bin/python -m pytest -q tests/test_aao_benchmark_strict.py`

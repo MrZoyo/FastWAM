@@ -63,13 +63,22 @@ def test_proprio_vector_requires_exact_dim() -> None:
 
 
 def test_default_benchmark_profiles_load_from_yaml() -> None:
+    open_door_back = _load_named_profile("open_door_airbot_play_back_gs")
     open_door = _load_named_profile("open_door_airbot_play_gs")
     cup = _load_named_profile("cup_on_coaster_gs_airbot_p7")
-    assert open_door.fastwam_config.endswith("configs/task/mix_uncond_2cam224_1e-4.yaml")
+    assert open_door_back.task == "open_door_airbot_play_back_gs"
+    assert open_door_back.fastwam_config is None
+    assert open_door_back.text_cache_dir is None
+    assert open_door_back.proprio_mode == "joint"
+    assert open_door_back.stride == 32
+    assert open_door_back.disable_arm_randomization is True
+    assert open_door.fastwam_config is None
+    assert open_door.text_cache_dir is None
     assert open_door.proprio_mode == "joint"
     assert open_door.stride == 32
     assert open_door.disable_arm_randomization is True
-    assert cup.fastwam_config.endswith("configs/task/cup_uncond_2cam224_1e-4.yaml")
+    assert cup.fastwam_config is None
+    assert cup.text_cache_dir is None
     assert cup.proprio_mode == "joint"
 
 
@@ -87,8 +96,8 @@ def test_custom_profile_config_loads_relative_paths(tmp_path) -> None:
                 "max_updates: 12",
                 "proprio_mode: cartesian",
                 "proprio_dim: 7",
-                "fastwam_config: configs/task/mix_uncond_2cam224_1e-4.yaml",
-                "text_cache_dir: data/text_embeds_cache/mix",
+                "fastwam_config: configs/task/custom_env.yaml",
+                "text_cache_dir: data/text_embeds_cache/custom_env",
             ]
         ),
         encoding="utf-8",
@@ -97,12 +106,12 @@ def test_custom_profile_config_loads_relative_paths(tmp_path) -> None:
     assert profile.name == "custom_env"
     assert profile.task == "custom_task"
     assert profile.action_repeat == 3
-    assert profile.fastwam_config.endswith("configs/task/mix_uncond_2cam224_1e-4.yaml")
+    assert profile.fastwam_config.endswith("configs/task/custom_env.yaml")
 
 
 def test_benchmark_profile_stride_can_be_overridden() -> None:
     args = SimpleNamespace(
-        profile="open_door_airbot_play_gs",
+        profile="open_door_airbot_play_back_gs",
         profile_config=None,
         task=None,
         instruction=None,
@@ -126,7 +135,7 @@ def test_benchmark_profile_stride_can_be_overridden() -> None:
 
 def test_benchmark_profile_arm_randomization_can_be_reenabled() -> None:
     args = SimpleNamespace(
-        profile="open_door_airbot_play_gs",
+        profile="open_door_airbot_play_back_gs",
         profile_config=None,
         task=None,
         instruction=None,
