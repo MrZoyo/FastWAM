@@ -10,7 +10,7 @@
 - `WorldModel_3d` 使用 `auto-atomic-operation` 作为仓库内 submodule，而不是外部软链接。
 - `WorldModel_3d/auto-atomic-operation` 最初参考 pin 为 `2f7a10b`；FastWAM 侧需要使用更新的 AAO open door/Airbot/GS 配置。
 - `2f7a10b` 之后包含大量 open door 相关修复和新增配置，包括 `open_door_airbot_play_gs.yaml`、`open_door_airbot_play_g2p.yaml`、`open_door_airbot_play_back_gs.yaml`、door 物理、GS、相机和 Airbot 配置更新。
-- FastWAM 已新增自己的 AAO submodule：`third_party/auto-atomic-operation`，跟踪 `main`，当前 pin 到 DISCOVER 远端 commit `8a9d5c76136ba7e02e14d25646d9b614ab984081`，该 commit 包含 OpenGHz 上游 `5303f50e0366a0c14560da133b8c85871bf0b95d`。
+- FastWAM 已新增自己的 AAO submodule：`third_party/auto-atomic-operation`，当前 pin 到 DISCOVER 远端 commit `d831ee7cecd4b87df2337bab7ec856d5a342b412`。
 - FastWAM 已新增 `third_party/GaussianRenderer` submodule，跟踪 `main`，当前 pin 到 `8eb95dd690626bdece989b6f1b2cad10371ce652`，用于 AAO GS open door。
 - FastWAM 已新增进程内 AAO 集成层，不依赖 WorldModel 风格的 WebSocket inference server。
 - FastWAM 的模型动作输出在模型归一化空间内，需要使用训练时 `FastWAMProcessor` 的 normalizer 做反归一化后再送给仿真器。
@@ -68,7 +68,7 @@ WorldModel 的闭环结构可以直接借鉴：
 - 状态：real_1048/mix 训练 state/action 是 7 维。AAO observation 提供的是 EEF pose 和 gripper；当前按以下语义适配：
   - 训练动作名：`delta_x, delta_y, delta_z, delta_roll, delta_pitch, delta_yaw, right_gripper_position`
   - AAO apply 期望：`cartesian_absolute`，即绝对 `[x, y, z, r, p, y, gripper]`
-  - FastWAM 预测经 normalizer 反归一化后，前 6 维按 delta EEF pose 累加到当前 EEF pose，最后 1 维 gripper length 按 absolute 值传给 AAO。
+  - 当前 LeRobot action 的前 6 维是帧对齐 backward delta：`pose[t] - pose[t-1]`，不是 `pose[t+1] - pose[t]`。AAO bridge 下发前会先把 action chunk 左移一帧，再累计积分到当前 EEF pose；最后 1 维 gripper length 不是 delta，只做同样的一帧时间对齐并按 absolute 值传给 AAO。
 - 文本：real_1048 instruction 是 `open the door`，已有 text embedding cache 路径候选为 `data/text_embeds_cache/real_1048/...pt`。
 - 权重：优先用 mix 20k 的 `step_020000.pt` 进行第一轮闭环集成测试；real_1048 当前训练产物等 checkpoint 生成后再切换。
 
@@ -81,7 +81,7 @@ WorldModel 的闭环结构可以直接借鉴：
 2. 仿真器依赖确认
    - 决定是在 FastWAM 仓库内新增 `auto-atomic-operation` submodule，还是复用 `/DATA/disk1/zoyo/WorldModel_3d/auto-atomic-operation`。
    - 第一版实现使用可配置 `--aao-root`，默认指向 FastWAM 内部 `third_party/auto-atomic-operation` submodule。
-   - submodule 跟踪 AAO `main`，当前 pin 到 DISCOVER 远端 `8a9d5c76136ba7e02e14d25646d9b614ab984081`，避免长期依赖 WorldModel 项目目录。
+   - submodule 跟踪 AAO `main`，当前 pin 到 DISCOVER 远端 `d831ee7cecd4b87df2337bab7ec856d5a342b412`，避免长期依赖 WorldModel 项目目录。
    - GS 渲染依赖固定到 FastWAM 内部 `third_party/GaussianRenderer` submodule。
    - 用户已确认本轮可直接补环境；后续新增依赖仍需在 progress 中记录具体变更。
 

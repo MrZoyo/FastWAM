@@ -51,9 +51,23 @@ text_cache_dir: data/text_embeds_cache/mix
 
 注意：
 
-- benchmark 统一向 AAO 下发 `cartesian_absolute`。
+- benchmark 统一向 AAO 下发 `cartesian_absolute`。AAO 的
+  `apply_pose_action()` 期望的是绝对 EEF 目标位姿，不是相对量。
 - 不支持 `joint_absolute` 控制；cup 只是模型输入 state 使用 8D joint + gripper。
-- 两个 profile 的模型输出都必须是 7D action：`[x, y, z, roll, pitch, yaw, gripper]`。
+- 两个 profile 的模型输出都必须是 7D action。默认 `--model-action-mode
+  delta6_abs_gripper` 对应当前 LeRobot 数据语义：前 6 维是帧对齐的 EEF
+  实际增量 `pose[t] - pose[t-1]`，第 7 维是绝对 gripper target。
+- 因为这份数据的 row 0 是“当前帧相对上一帧”的 backward delta，AAO bridge
+  会先把 action chunk 左移一帧，再对前 6 维做累计积分，得到要下发给 AAO
+  的绝对 `[x, y, z, roll, pitch, yaw]` 目标；gripper 不做积分，只做同样的
+  一帧时间对齐并作为绝对目标下发。
+- 如果以后训练数据已经改成 `pose[t+1] - pose[t]` 的 forward delta，可以显式
+  传 `--model-action-mode delta6_abs_gripper_forward`，此时不做一帧左移，但仍会
+  对前 6 维累计积分后再下发 `cartesian_absolute`。
+- 要直接验证数据集 action 在 AAO 中的效果，用
+  `scripts/replay_lerobot_action_to_aao.py`。它使用 AAO DataReplay 从源 MCAP
+  首帧和 `transform_resets` 初始化，再跳过 row 0 并把后续 backward delta
+  累计成绝对 EEF target。
 - cup 只使用 `cup_on_coaster_gs_airbot_p7`。不要把 cup profile 的 `task` 覆盖成
   `cup_on_coaster_airbot_p7_umi` 或其他 UMI v3 场景；这些场景没有作为 FastWAM
   cup benchmark 的有效目标。
@@ -116,6 +130,10 @@ ls -lh data/text_embeds_cache/cup
 `dataset_stats.json` 用于把 AAO observation 转成训练分布里的归一化 state，
 并把模型输出的归一化 action 反归一化回真实 action。它必须和 checkpoint
 对应的训练数据一致；mix 和 cup 不能混用。
+
+如果要运行 `scripts/replay_lerobot_action_to_aao.py`，还需要 README 中的
+MCAP decoder 依赖：`mcap` 和 `mcap-ros2idl-support`。缺少这些包时，AAO
+DataReplay 无法从源 MCAP 初始化首帧 joint 和 transform reset。
 
 text cache 必须和 profile 的 instruction 一致：
 

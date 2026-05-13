@@ -553,7 +553,11 @@ def build_argparser() -> argparse.ArgumentParser:
              "different runs/datasets have different normalization stats, do not rely on a fallback.")
     parser.add_argument("--text-cache-dir", default="data/text_embeds_cache/mix")
     parser.add_argument("--instruction", default="open the door")
-    parser.add_argument("--model-action-mode", choices=("delta6_abs_gripper", "absolute", "absolute_joint"), default="delta6_abs_gripper")
+    parser.add_argument(
+        "--model-action-mode",
+        choices=("delta6_abs_gripper", "delta6_abs_gripper_forward", "absolute", "absolute_joint"),
+        default="delta6_abs_gripper",
+    )
     parser.add_argument("--output-action-format", choices=("cartesian_absolute", "joint_absolute"), default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--num-inference-steps", type=int, default=10)

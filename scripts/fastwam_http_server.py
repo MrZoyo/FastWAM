@@ -219,16 +219,20 @@ def _request_to_model_input(payload: dict[str, Any]) -> dict[str, Any]:
         "images": images,
         "proprio_raw": proprio_raw,
     }
-    for key in ("current_position", "joint_position", "cartesian_position"):
+    for key in ("current_position", "cartesian_position"):
         if key in payload and payload[key] is not None:
             model_input["current_position"] = _require_array(payload, key)
             if model_input["current_position"].size < 6:
                 raise ValueError(f"Field '{key}' must contain at least 6 values.")
             break
     if "current_position" not in model_input:
-        if proprio_raw.size < 6:
-            raise ValueError("Field 'proprio_raw' must contain at least 6 values.")
-        model_input["current_position"] = proprio_raw[:6]
+        action_mode = "delta6_abs_gripper" if _CLIENT is None else _CLIENT.action_mode
+        if action_mode.startswith("delta6_abs_gripper"):
+            raise ValueError(
+                "Field 'current_position' or 'cartesian_position' is required for "
+                "delta6_abs_gripper action modes. It must be the current 6D EEF pose, "
+                "not joint proprio_raw[:6]."
+            )
     if "instruction" in payload and payload["instruction"] is not None:
         model_input["instruction"] = str(payload["instruction"])
     return model_input
@@ -262,13 +266,14 @@ def _schema() -> dict[str, Any]:
             "undistort.rotation": "optional 3x3 stereo rotation, alternative to left_to_right",
             "undistort.translation": "optional 3D stereo translation, alternative to left_to_right",
             "undistort.alpha": "optional OpenCV free scaling parameter, default 0.0",
-            "proprio_raw": "raw 7D real_1048 proprio vector [joint0..joint5, gripper]",
-            "current_position": "optional 6D base position for delta accumulation; defaults to proprio_raw[:6]",
+            "proprio_raw": "raw model proprio vector; real_1048 uses [joint0..joint5, gripper]",
+            "current_position": "required 6D current EEF pose [x,y,z,roll,pitch,yaw] for delta6_abs_gripper modes; cartesian_position is accepted as an alias",
         },
         "response": {
-            "action_format": "joint_absolute",
-            "actions": "[T,7] absolute action chunk",
+            "action_format": "cartesian_absolute",
+            "actions": "[T,7] absolute EEF action chunk [x,y,z,roll,pitch,yaw,gripper]",
             "action_mode": "delta6_abs_gripper",
+            "action_semantics": "description of delta shifting/integration before the absolute action chunk is returned",
             "normalized_action_shape": "[T,D] model output shape before denormalization",
             "full_prompt": "prompt used to load the text embedding cache",
         },
@@ -352,6 +357,7 @@ def _init_client(args: argparse.Namespace) -> FastWAMModelClient:
         seed=args.seed,
         rand_device=args.rand_device,
         preload_text_context=False,
+        action_mode=args.model_action_mode,
         output_action_format=args.output_action_format,
     )
     return client
@@ -377,7 +383,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--num-inference-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rand-device", default="cpu")
-    parser.add_argument("--output-action-format", default="joint_absolute")
+    parser.add_argument(
+        "--model-action-mode",
+        choices=("delta6_abs_gripper", "delta6_abs_gripper_forward", "absolute", "absolute_joint"),
+        default="delta6_abs_gripper",
+    )
+    parser.add_argument("--output-action-format", default="cartesian_absolute")
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -400,6 +411,7 @@ def main(argv: list[str] | None = None) -> None:
         "video_size": list(_CLIENT.video_size),
         "proprio_dim": _CLIENT.proprio_dim,
         "action_horizon": _CLIENT.action_horizon,
+        "action_mode": _CLIENT.action_mode,
         "num_inference_steps": _CLIENT.num_inference_steps,
         "device": _CLIENT.device,
         "opencv_available": opencv_available(),

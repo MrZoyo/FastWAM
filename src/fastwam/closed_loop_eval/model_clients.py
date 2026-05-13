@@ -177,7 +177,12 @@ class FastWAMModelClient(BaseModelClient):
         self.output_action_format = str(output_action_format)
         self.call_index = 0
 
-        supported_action_modes = {"delta6_abs_gripper", "absolute", "absolute_joint"}
+        supported_action_modes = {
+            "delta6_abs_gripper",
+            "delta6_abs_gripper_forward",
+            "absolute",
+            "absolute_joint",
+        }
         if self.action_mode not in supported_action_modes:
             raise ValueError(
                 f"Unsupported action_mode='{self.action_mode}'. "
@@ -271,6 +276,7 @@ class FastWAMModelClient(BaseModelClient):
                 "actions": self._format_actions(denorm_action[index], model_input).astype(np.float32, copy=False),
                 "source": "fastwam",
                 "action_mode": self.action_mode,
+                "action_semantics": self._action_semantics(),
                 "normalized_action_shape": list(action_norm.shape),
                 "batch_size": len(model_inputs),
                 "batch_index": index,
@@ -329,6 +335,7 @@ class FastWAMModelClient(BaseModelClient):
             "video": list(output["video"]),
             "source": "fastwam_joint_video",
             "action_mode": self.action_mode,
+            "action_semantics": self._action_semantics(),
             "num_video_frames": int(num_video_frames),
             "normalized_action_shape": list(action_norm.shape),
             "full_prompt": full_prompt,
@@ -440,17 +447,58 @@ class FastWAMModelClient(BaseModelClient):
     def _format_actions(self, denorm_action: np.ndarray, model_input: dict[str, Any]) -> np.ndarray:
         if self.action_mode == "delta6_abs_gripper":
             current_position = self._resolve_current_position(model_input)
-            return self._delta_to_absolute(denorm_action, current_position)
+            return self._delta_to_absolute(denorm_action, current_position, frame_aligned_backward_delta=True)
+        if self.action_mode == "delta6_abs_gripper_forward":
+            current_position = self._resolve_current_position(model_input)
+            return self._delta_to_absolute(denorm_action, current_position, frame_aligned_backward_delta=False)
         if self.action_mode in {"absolute", "absolute_joint"}:
             return np.asarray(denorm_action, dtype=np.float32)
         raise ValueError(f"Unsupported action_mode='{self.action_mode}'.")
 
-    def _delta_to_absolute(self, action_delta: np.ndarray, current_cartesian: np.ndarray) -> np.ndarray:
+    def _action_semantics(self) -> str:
+        if self.action_mode == "delta6_abs_gripper":
+            return (
+                "LeRobot frame-aligned EEF delta: raw row t is pose[t]-pose[t-1]. "
+                "The bridge shifts rows left once, cumulatively integrates the first 6 dims "
+                "from the current EEF pose, and sends an absolute gripper target."
+            )
+        if self.action_mode == "delta6_abs_gripper_forward":
+            return (
+                "Forward EEF delta: raw row t is already the next-step pose delta. "
+                "The bridge cumulatively integrates the first 6 dims from the current EEF pose "
+                "and sends an absolute gripper target."
+            )
+        return "Model output is already absolute in the requested action format."
+
+    @staticmethod
+    def _delta_to_absolute(
+        action_delta: np.ndarray,
+        current_cartesian: np.ndarray,
+        *,
+        frame_aligned_backward_delta: bool = True,
+    ) -> np.ndarray:
         action = np.asarray(action_delta, dtype=np.float32).copy()
+        if action.ndim == 1:
+            action = action.reshape(1, -1)
+        if action.ndim != 2 or action.shape[1] < 7:
+            raise RuntimeError(f"delta6_abs_gripper action must have shape [T,7+], got {action.shape}.")
         current = np.asarray(current_cartesian, dtype=np.float32).reshape(-1)
         if current.size < 6:
             raise RuntimeError("current_cartesian must contain at least 6 values.")
-        action[:, :6] = action[:, :6] + current[:6][None, :]
+        step_delta = action[:, :6].copy()
+        if frame_aligned_backward_delta:
+            # LeRobot eef_delta_gripper data stores delta[t] = pose[t] - pose[t-1].
+            # For a command after obs[t], row 0 is the previous transition, so use
+            # rows 1..T-1 as future increments and hold the last target.
+            shifted_delta = np.zeros_like(step_delta)
+            if step_delta.shape[0] > 1:
+                shifted_delta[:-1] = step_delta[1:]
+                shifted_gripper = action[:, 6].copy()
+                shifted_gripper[:-1] = action[1:, 6]
+                shifted_gripper[-1] = action[-1, 6]
+                action[:, 6] = shifted_gripper
+            step_delta = shifted_delta
+        action[:, :6] = current[:6][None, :] + np.cumsum(step_delta, axis=0)
         return action
 
     def _get_text_context(self, instruction: str) -> tuple[torch.Tensor, torch.Tensor, str]:
@@ -526,6 +574,7 @@ def _fastwam_model_worker_loop(
                     "device": "cuda:0",
                     "proprio_dim": int(client.proprio_dim),
                     "model_action_dim": int(client.model_action_dim),
+                    "action_mode": client.action_mode,
                     "checkpoint_path": str(client.checkpoint_path),
                     "dataset_stats_path": str(client.dataset_stats_path),
                     "config_path": str(client.config_path),
@@ -756,12 +805,16 @@ class ParallelFastWAMModelClient(BaseModelClient):
     def _validate_worker_metadata(self) -> None:
         proprio_dims = {int(item["proprio_dim"]) for item in self.worker_metadata}
         action_dims = {int(item["model_action_dim"]) for item in self.worker_metadata}
+        action_modes = {str(item.get("action_mode")) for item in self.worker_metadata}
         if len(proprio_dims) != 1:
             raise RuntimeError(f"Model workers disagree on proprio_dim: {sorted(proprio_dims)}.")
         if len(action_dims) != 1:
             raise RuntimeError(f"Model workers disagree on model_action_dim: {sorted(action_dims)}.")
+        if len(action_modes) != 1:
+            raise RuntimeError(f"Model workers disagree on action_mode: {sorted(action_modes)}.")
         self.proprio_dim = proprio_dims.pop()
         self.model_action_dim = action_dims.pop()
+        self.action_mode = action_modes.pop()
 
     def _get_response_until(self, deadline: float, ready_workers: set[int] | None = None) -> dict[str, Any]:
         while True:

@@ -74,6 +74,7 @@ def _build_model_client(args: argparse.Namespace) -> BaseModelClient:
         num_inference_steps=args.num_inference_steps,
         seed=args.seed,
         rand_device=args.rand_device,
+        action_mode=args.model_action_mode,
     )
 
 
@@ -248,6 +249,7 @@ def _run_one(
             "selected_cameras": selected_cameras,
             "stage_plans": sim.stage_plans,
             "model_client": args.model_client,
+            "model_action_mode": args.model_action_mode,
             "control": _control_metadata(args, sim_info=sim_info, stride=stride),
         }
         adapter = AAOObservationAdapter(
@@ -282,9 +284,10 @@ def _run_one(
                 model_input = adapter.build_model_input(camera_map)
                 model_response = model_client.infer(model_input)
                 actions = _clamp_gripper(
-                    _validated_actions(model_response),
+                    _validated_actions(model_response, expected_format="cartesian_absolute", action_dim=7),
                     gripper_min=args.gripper_min,
                     gripper_max=args.gripper_max,
+                    gripper_index=-1,
                 )
                 remaining_updates = args.max_updates - updates_used
                 chunk_steps = min(
@@ -557,6 +560,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-stats", default=str(DEFAULT_MIX_STATS))
     parser.add_argument("--text-cache-dir", default="data/text_embeds_cache/mix")
     parser.add_argument("--instruction", default="open the door")
+    parser.add_argument(
+        "--model-action-mode",
+        choices=("delta6_abs_gripper", "delta6_abs_gripper_forward", "absolute"),
+        default="delta6_abs_gripper",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--num-inference-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)

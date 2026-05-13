@@ -247,7 +247,7 @@
     - video shape: `672x448`, fps `10`
   - 说明：mix 配置下 `action_horizon=32, num_video_frames=9`，pred/recon 每个 window 只有 9 个模型视频帧；`sim-update` 模式按最近邻展开到每个 AAO update，actual 行为逐 AAO update 真实取图。
 - README / README_zh 已补充：
-  - 当前 AAO submodule pin 为 `8a9d5c7`，包含 OpenGHz upstream `5303f50`。
+  - 当时 AAO submodule pin 为 `8a9d5c7`，包含 OpenGHz upstream `5303f50`。
   - visual rollout 入口和 `--frame-sampling sim-update` 示例。
 
 ### 需要确认
@@ -264,3 +264,31 @@
 3. 重点检查第二个 chunk 后 gripper 从约 `0.09` 快速降到 `0.02` 的行为是否符合训练数据；如果 AAO finger distance 与训练 length 不同，加入显式 gripper length mapping。
 4. 对 `stride=8` 的 AAO success 假阳性，继续用 `mujoco_diagnostics` 的 door/handle hinge delta 和视频末帧作为主判据。
 5. 当前 real_1048 训练到第一个可用 checkpoint 后，把 `--fastwam-config/--checkpoint/--dataset-stats/--text-cache-dir` 切到 real_1048 run，并用视频 + 物理状态 trace 共同判定。
+
+## 2026-05-13
+
+### 已完成
+
+- 重新同步 AAO submodule 到 DISCOVER 远端 `d831ee7cecd4b87df2337bab7ec856d5a342b412`。
+- 确认 AAO `apply_pose_action()` 需要绝对 EEF target，不接受 LeRobot delta 直接下发。
+- 修正 FastWAM bridge 默认 action 语义：当前 `delta6_abs_gripper` 会把 LeRobot
+  `pose[t] - pose[t-1]` backward delta 左移一帧，然后从当前 EEF pose 累计积分；
+  gripper 是绝对 target，只做同样的一帧时间对齐，不做积分。
+- HTTP inference 服务不再在 delta action mode 下把 `proprio_raw[:6]` 当作积分基准；
+  调用方必须传当前 EEF pose `current_position` 或 `cartesian_position`。
+- 新增 `scripts/replay_lerobot_action_to_aao.py`，用于把本地 LeRobot sim episode
+  的 action 直接 replay 到 AAO，输出 `aao_replay_multicam.mp4`、
+  `dataset_vs_aao_replay.mp4`、`summary.json` 和 `trace.json.gz`。
+- 已用 `/DATA/disk1/zoyo/sim/open_door_augmented_sim_lerobot` 的
+  `episode_000000` / `door_2` 验证 replay：输出在
+  `runs/aao_dataset_action_replay/episode_000000_door2_20260513`，dataset 118 帧，
+  replay 117 个 action，door hinge 从约 `0` 到 `-0.231 rad`，handle hinge
+  增加约 `0.053 rad`。
+- 已用 mix 20k ckpt 跑 3 个 open-door AAO episode，视频在
+  `runs/aao_closed_loop/mix20k_open_door_gs_3ep_20260513_actionfix/`。
+
+### 注意
+
+- 旧文档中把 AAO 当前 pin 写成 `8a9d5c7` 或把 HTTP response 写成
+  `joint_absolute` 的描述已经过时；当前 AAO pin 是 `d831ee7`，AAO bridge 默认
+  输出 `cartesian_absolute`。

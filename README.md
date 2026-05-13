@@ -21,8 +21,7 @@ bridge supports the GS open-door Airbot Play setup and the P7 cup-on-coaster tas
 The integration is intentionally kept separate from the training pipeline:
 
 - AAO is vendored as `third_party/auto-atomic-operation` and pinned to the
-  latest DISCOVER fork commit used here. The current pin is `449119b`, which
-  includes the upstream rename commit `d1530c7`.
+  latest DISCOVER fork commit used here. The current pin is `d831ee7`.
 - Gaussian rendering support is vendored as `third_party/GaussianRenderer`.
 - The FastWAM closed-loop bridge lives in `src/fastwam/closed_loop_eval/`.
 - Single-episode evaluation entrypoint:
@@ -31,6 +30,8 @@ The integration is intentionally kept separate from the training pipeline:
   `scripts/run_aao_open_door_gs_sweep.py`.
 - Pred/VAE-recon/actual simulator comparison video entrypoint:
   `scripts/run_aao_visual_rollout.py`.
+- Local LeRobot sim dataset action replay into AAO:
+  `scripts/replay_lerobot_action_to_aao.py`.
 - Batch benchmark entrypoint:
   `scripts/run_aao_benchmark.py`; see `docs/aao_benchmark.md`.
 - Batch benchmark smoke entrypoint:
@@ -75,9 +76,19 @@ settings are:
 
 Batch benchmark profiles live in `configs/aao_benchmark/`. The current presets
 are `open_door_airbot_play_gs` and `cup_on_coaster_gs_airbot_p7`; new test envs
-can be supplied with `--profile-config <yaml>`. Both preset profiles use 7D EEF
-pose + gripper model actions and send `cartesian_absolute` commands to AAO. The
-cup profile uses 8D joint + gripper proprio as model input, but it does not use
+can be supplied with `--profile-config <yaml>`. AAO `apply_pose_action()`
+expects absolute EEF pose targets, so the bridge always sends
+`cartesian_absolute` commands. The default FastWAM action mode is
+`delta6_abs_gripper`: the model is trained on LeRobot frame-aligned EEF deltas
+`pose[t] - pose[t-1]` for the first 6 dimensions and an absolute gripper target
+for the last dimension. Before sending commands to AAO, the bridge shifts the
+chunk left by one frame, cumulatively integrates the first 6 dimensions from the
+current EEF pose, and leaves the gripper as an absolute target. If a future
+checkpoint is trained on already-forward deltas `pose[t+1] - pose[t]`, use
+`--model-action-mode delta6_abs_gripper_forward`.
+
+Both preset profiles use 7D EEF pose + gripper model actions. The cup profile
+uses 8D joint + gripper proprio as model input, but it does not use
 `joint_absolute` control. The cup checkpoint/profile is only validated for the
 `cup_on_coaster_gs_airbot_p7` AAO task; do not override it to
 `cup_on_coaster_airbot_p7_umi` or other UMI v3 tasks. Batch benchmark currently
@@ -90,6 +101,22 @@ open-door criterion for the current setup. Batch benchmark records `stage_name`,
 `benchmark_results.jsonl`; use those fields to interpret failures and success
 semantics. For visual inspection, use the single-episode runner or visual
 rollout.
+
+To validate dataset actions against AAO initialization/control semantics,
+replay a local LeRobot sim episode directly. The script uses AAO
+`DataReplayRunner` to reset from the source MCAP first-frame joints and
+`transform_resets`, then skips `action[0]`, cumulatively integrates
+`action[1:]` backward deltas into absolute EEF targets, and sends those targets
+to AAO:
+
+```bash
+.venv/bin/python -B scripts/replay_lerobot_action_to_aao.py \
+  --episode-index 0 \
+  --variant door_2 \
+  --variant-env-index 2 \
+  --gpu 0 \
+  --output-dir runs/aao_dataset_action_replay/episode_000000_door2
+```
 
 For visual debugging of the model's imagined future against VAE reconstruction
 and actual AAO observations, use the visual rollout script. `--frame-sampling
@@ -137,6 +164,16 @@ uv pip install --python .venv/bin/python \
   ninja \
   natsort \
   PyOpenGL_accelerate
+```
+
+If you need the source-MCAP DataReplay tools such as
+`scripts/replay_lerobot_action_to_aao.py`, also install the MCAP decoder
+dependencies:
+
+```bash
+uv pip install --python .venv/bin/python \
+  mcap \
+  mcap-ros2idl-support
 ```
 
 If you use conda instead of `.venv`, replace `.venv/bin/python` with the

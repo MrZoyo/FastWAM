@@ -167,6 +167,7 @@ def _build_model_client(args: argparse.Namespace) -> FastWAMModelClient:
         num_inference_steps=args.num_inference_steps,
         seed=args.seed,
         rand_device=args.rand_device,
+        action_mode=args.model_action_mode,
     )
 
 
@@ -243,9 +244,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 test_action_with_infer_action=args.test_action_consistency,
             )
             actions = _clamp_gripper(
-                _validated_actions(response),
+                _validated_actions(response, expected_format="cartesian_absolute", action_dim=7),
                 gripper_min=args.gripper_min,
                 gripper_max=args.gripper_max,
+                gripper_index=-1,
             )
             remaining_model_steps = max_model_steps - model_steps_used
             chunk_steps = min(args.action_horizon, len(actions), remaining_model_steps)
@@ -378,6 +380,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "fastwam_config": str(Path(args.fastwam_config).expanduser()),
         "dataset_stats": str(Path(args.dataset_stats).expanduser()),
         "text_cache_dir": str(Path(args.text_cache_dir).expanduser()),
+        "model_action_mode": args.model_action_mode,
         "camera_map": _parse_camera_map(args.camera_map),
         "selected_cameras": selected_cameras if "selected_cameras" in locals() else None,
         "control": {
@@ -434,6 +437,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-stats", default=str(DEFAULT_MIX_STATS))
     parser.add_argument("--text-cache-dir", default="data/text_embeds_cache/mix")
     parser.add_argument("--instruction", default="open the door")
+    parser.add_argument(
+        "--model-action-mode",
+        choices=("delta6_abs_gripper", "delta6_abs_gripper_forward", "absolute"),
+        default="delta6_abs_gripper",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--num-inference-steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)

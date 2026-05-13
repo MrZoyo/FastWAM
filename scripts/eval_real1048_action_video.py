@@ -584,8 +584,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         pred_delta = client._denormalize_action(pred_norm, proprio_norm)
         pred_abs = client._delta_to_absolute(pred_delta, proprio_raw[:6])
         gt_delta = raw_action[:horizon].numpy().astype(np.float32)
-        gt_abs = gt_delta.copy()
-        gt_abs[:, :6] = gt_abs[:, :6] + proprio_raw[:6][None, :]
+        gt_abs = client._delta_to_absolute(gt_delta, proprio_raw[:6])
 
         pred_delta = pred_delta[:horizon]
         pred_abs = pred_abs[:horizon]
@@ -709,8 +708,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "video_action_source": args.video_action_source,
         "action_space_note": (
             "action_errors.csv compares denormalized model action with raw dataset action in "
-            "delta6_abs_gripper space. Adding current state to both gives the absolute x/y/z "
-            "columns and leaves the error unchanged for the first 6 dims."
+            "delta6_abs_gripper space. The absolute x/y/z columns follow the AAO bridge: "
+            "skip the frame-aligned backward delta at row 0, cumulatively integrate future "
+            "EEF deltas from the current state, and keep the gripper as an absolute target."
         ),
         "action_summary": _summarize_actions(action_rows),
         "video_summary": video_summary,

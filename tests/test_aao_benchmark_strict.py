@@ -11,6 +11,7 @@ from fastwam.closed_loop_eval.benchmark import (
     _load_profile_file,
     _require_vector_dim,
 )
+from fastwam.closed_loop_eval.model_clients import FastWAMModelClient
 from fastwam.closed_loop_eval.observation_adapter import AAOObservationAdapter
 from fastwam.closed_loop_eval.runner import _validated_actions
 from fastwam.closed_loop_eval.sim_service_client import SimulatorServiceClient
@@ -151,6 +152,42 @@ def test_cartesian_actions_reject_extra_columns() -> None:
             expected_format="cartesian_absolute",
             action_dim=7,
         )
+
+
+def test_delta6_abs_gripper_shifts_backward_delta_and_cumsum() -> None:
+    current = np.asarray([10.0, 20.0, 30.0, 0.1, 0.2, 0.3], dtype=np.float32)
+    raw = np.asarray(
+        [
+            [100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.10],
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.20],
+            [2.0, 0.0, 0.0, 0.0, 0.0, 0.2, 0.30],
+            [3.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.40],
+        ],
+        dtype=np.float32,
+    )
+
+    converted = FastWAMModelClient._delta_to_absolute(raw, current)
+
+    np.testing.assert_allclose(converted[:, 0], [11.0, 13.0, 16.0, 16.0])
+    np.testing.assert_allclose(converted[:, 5], [0.4, 0.6, 0.9, 0.9], atol=1e-6)
+    np.testing.assert_allclose(converted[:, 6], [0.20, 0.30, 0.40, 0.40], atol=1e-6)
+
+
+def test_delta6_abs_gripper_forward_cumsums_without_shift() -> None:
+    current = np.asarray([10.0, 20.0, 30.0, 0.1, 0.2, 0.3], dtype=np.float32)
+    raw = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.20],
+            [2.0, 0.0, 0.0, 0.0, 0.0, 0.2, 0.30],
+        ],
+        dtype=np.float32,
+    )
+
+    converted = FastWAMModelClient._delta_to_absolute(raw, current, frame_aligned_backward_delta=False)
+
+    np.testing.assert_allclose(converted[:, 0], [11.0, 13.0])
+    np.testing.assert_allclose(converted[:, 5], [0.4, 0.6], atol=1e-6)
+    np.testing.assert_allclose(converted[:, 6], [0.20, 0.30], atol=1e-6)
 
 
 def test_action_expansion_rejects_single_row_broadcast() -> None:

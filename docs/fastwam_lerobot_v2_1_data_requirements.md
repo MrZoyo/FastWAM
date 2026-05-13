@@ -231,6 +231,28 @@ LIBERO 当前是 7 维：
 - `delta_action_dim_mask`
 - 训练和推理时的归一化统计
 
+时间语义需要单独确认。当前 real/mix/cup 数据里的默认 7D action 是：
+
+```text
+[delta_x, delta_y, delta_z, delta_roll, delta_pitch, delta_yaw, right_gripper_position]
+```
+
+其中前 6 维来自逐帧差分 `pose[t] - pose[t-1]`，也就是“当前帧相对上一帧的
+实际变化量”；第 7 维 gripper 是绝对位置，不是 delta。`RobotVideoDataset`
+读取 action 时从当前样本时间 `t` 开始取 `[t, t+1, ...]`，所以 row 0 是
+backward delta。AAO bridge 的默认 `delta6_abs_gripper` 会对此做一帧左移并
+累计积分后再下发绝对 EEF pose。如果你重新生成数据，推荐直接写成
+`pose[t+1] - pose[t]` 的 forward delta，并在闭环评测时使用
+`--model-action-mode delta6_abs_gripper_forward`。
+
+当前数据转换链路中，`eef_delta_gripper` action 来自 Step1 H5 的
+`action/right_rel_pos`、`action/right_rel_rot_euler` 和
+`action/right_gripper_position`；`right_rel_*` 是对当前帧绝对 EEF pose 做
+逐帧差分得到的 backward delta。需要验证某个 sim episode 时，可以用
+`scripts/replay_lerobot_action_to_aao.py` 把 LeRobot action replay 到 AAO；该
+脚本使用源 MCAP 做 AAO DataReplay reset，跳过 row 0，再把 row 1..N 累计成
+绝对 EEF target。
+
 ### 3.3 状态 / proprio 数据
 
 状态默认会被整理成 `proprio`。

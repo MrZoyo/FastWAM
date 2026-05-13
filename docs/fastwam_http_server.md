@@ -126,8 +126,16 @@ PyTorch still reports the selected visible GPU as `cuda:0`.
 
 `images` keys must match the model config. `real_1048` expects `head_left` and `right_wrist_left`.
 `proprio_raw` is the 7D real_1048 state: six arm joint values followed by gripper position.
-The server accumulates the predicted first six delta dimensions onto `proprio_raw[:6]` by default.
-You may pass `current_position`, `joint_position`, or `cartesian_position` as a 6D override if needed.
+The default `action_mode` is `delta6_abs_gripper`, matching the current LeRobot
+data: the first six action dimensions are frame-aligned EEF deltas
+`pose[t] - pose[t-1]`, while the final gripper dimension is an absolute target.
+The server shifts the predicted action chunk left by one frame, cumulatively
+integrates the first six dimensions from the current 6D EEF pose, and keeps the
+gripper as an absolute target. For delta modes, the request must include
+`current_position` or `cartesian_position` as `[x,y,z,roll,pitch,yaw]`; this is
+not the same as `proprio_raw[:6]` when `proprio_raw` is joint state. Use `--model-action-mode
+delta6_abs_gripper_forward` only for checkpoints trained on already-forward
+EEF deltas `pose[t+1] - pose[t]`.
 
 For the `1088x1280` path, the server treats the two model images as a stereo pair and runs
 OpenCV undistortion/rectification at **native resolution** (no `K` scaling — calibration must
@@ -156,22 +164,24 @@ The following malformed requests return HTTP 400:
 
 ```json
 {
-  "action_format": "joint_absolute",
+  "action_format": "cartesian_absolute",
   "actions": [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
   "source": "fastwam",
   "action_mode": "delta6_abs_gripper",
+  "action_semantics": "...",
   "normalized_action_shape": [32, 7],
   "full_prompt": "...",
   "instruction": "..."
 }
 ```
 
-`actions` is an `[action_horizon, 7]` list. The first six dimensions are absolute joint targets,
-computed as predicted delta plus the current six joint values; the last dimension is the predicted gripper target.
+`actions` is an `[action_horizon, 7]` list. The first six dimensions are
+absolute targets after the one-frame shift and cumulative delta integration;
+the last dimension is the predicted absolute gripper target.
 
 ## Verified On 5090
 
 - `GET /health` reports `image_keys=["head_left","right_wrist_left"]`, `proprio_dim=7`, and checkpoint `step_020000.pt`.
 - `GET /health` also reports `opencv_available=true` on the 5090 runtime.
-- A real dataset frame from `/data_hdd/Lyle/Datasets/real_1048` returns HTTP 200 with `action_format="joint_absolute"` and `actions` shape `[32,7]`.
+- A real dataset frame returns HTTP 200 with `action_format="cartesian_absolute"` and `actions` shape `[32,7]` when the request includes the current EEF pose.
 - Malformed requests return HTTP 400, including non-7D `proprio_raw` and missing camera keys.

@@ -20,13 +20,15 @@
 场景。这部分和训练主流程解耦：
 
 - AAO 以 submodule 形式放在 `third_party/auto-atomic-operation`，当前 pin
-  到 DISCOVER fork 的 `449119b`，该版本包含上游重命名提交 `d1530c7`。
+  到 DISCOVER fork 的 `d831ee7`。
 - Gaussian renderer 以 submodule 形式放在 `third_party/GaussianRenderer`。
 - FastWAM 到 AAO 的闭环桥接代码在 `src/fastwam/closed_loop_eval/`。
 - 单 episode 入口：`scripts/run_aao_closed_loop_eval.py`。
 - 多门/多背景 sweep 入口：`scripts/run_aao_open_door_gs_sweep.py`。
 - pred / VAE recon / 实际仿真对比视频入口：
   `scripts/run_aao_visual_rollout.py`。
+- 本地 LeRobot sim 数据集 action replay 到 AAO 的排查入口：
+  `scripts/replay_lerobot_action_to_aao.py`。
 - batch benchmark 入口：`scripts/run_aao_benchmark.py`，详细用法见
   `docs/aao_benchmark.md`。
 - batch benchmark smoke 入口：`scripts/run_aao_benchmark_smoke_tests.py`。
@@ -69,10 +71,19 @@ embedding cache 和 checkpoint；如果使用别的 run，用 `--fastwam-config`
 
 batch benchmark 的 profile 配置在 `configs/aao_benchmark/`，当前预设
 `open_door_airbot_play_gs` 和 `cup_on_coaster_gs_airbot_p7`。也可以通过
-`--profile-config <yaml>` 接入新的测试 env。两个预设 profile 的模型输出都按
-7D EEF pose + gripper 处理，并统一向 AAO 下发 `cartesian_absolute`；cup
-profile 的模型输入 state 是 8D joint + gripper，但不走 `joint_absolute`
-控制。cup checkpoint/profile 只验证 `cup_on_coaster_gs_airbot_p7` 这个 AAO
+`--profile-config <yaml>` 接入新的测试 env。AAO `apply_pose_action()` 需要的是
+绝对 EEF 目标位姿，所以 bridge 统一向 AAO 下发 `cartesian_absolute`。
+默认 `--model-action-mode delta6_abs_gripper` 对应当前 LeRobot 数据语义：
+前 6 维是帧对齐的 EEF 实际增量 `pose[t] - pose[t-1]`，第 7 维是绝对
+gripper target。下发给 AAO 前，bridge 会先把 action chunk 左移一帧，再对
+前 6 维做累计积分，得到基于当前 EEF pose 的绝对目标；gripper 不做积分，只
+做同样的一帧时间对齐并作为绝对目标下发。如果以后训练数据已经改成
+`pose[t+1] - pose[t]` 的 forward delta，使用
+`--model-action-mode delta6_abs_gripper_forward`。
+
+两个预设 profile 的模型输出都按 7D EEF pose + gripper 处理；cup profile
+的模型输入 state 是 8D joint + gripper，但不走 `joint_absolute` 控制。cup
+checkpoint/profile 只验证 `cup_on_coaster_gs_airbot_p7` 这个 AAO
 task，不要覆盖成 `cup_on_coaster_airbot_p7_umi` 或其他 UMI v3 场景。batch
 benchmark 当前只支持 lockstep，即 `--sim-loop-frequency 0`。多 env、多模型
 GPU 的 benchmark 用法见 `docs/aao_benchmark.md`。
@@ -81,6 +92,20 @@ GPU 的 benchmark 用法见 `docs/aao_benchmark.md`。
 batch benchmark 会在 `benchmark_results.csv` / `benchmark_results.jsonl` 中记录
 `stage_name`、`phase` 和 `task_details`，需要结合这些字段判断失败原因和
 success 语义。需要视觉排查时，再用单 episode runner 或 visual rollout。
+
+需要验证数据集 action 和 AAO 初始化/控制语义是否一致时，可以直接 replay
+本地 LeRobot sim episode。这个脚本使用 AAO `DataReplayRunner` 从源 MCAP 首帧
+joint 和 `transform_resets` 初始化，然后跳过 `action[0]`，把
+`action[1:]` 的 backward delta 累计成绝对 EEF target 下发给 AAO：
+
+```bash
+.venv/bin/python -B scripts/replay_lerobot_action_to_aao.py \
+  --episode-index 0 \
+  --variant door_2 \
+  --variant-env-index 2 \
+  --gpu 0 \
+  --output-dir runs/aao_dataset_action_replay/episode_000000_door2
+```
 
 需要对比模型想象视频、VAE recon 和 AAO 实际观测时，可以使用 visual
 rollout 脚本。`--frame-sampling sim-update` 会按每个 AAO update 输出一帧；
@@ -126,6 +151,15 @@ uv pip install --python .venv/bin/python \
   ninja \
   natsort \
   PyOpenGL_accelerate
+```
+
+如果要运行 `scripts/replay_lerobot_action_to_aao.py` 这类基于源 MCAP 的
+DataReplay 工具，还需要安装 MCAP decoder：
+
+```bash
+uv pip install --python .venv/bin/python \
+  mcap \
+  mcap-ros2idl-support
 ```
 
 如果你使用 conda 环境，把 `.venv/bin/python` 换成对应 conda 环境里的

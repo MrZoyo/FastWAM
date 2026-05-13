@@ -1068,7 +1068,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-stats", default=None)
     parser.add_argument("--text-cache-dir", default=None)
     parser.add_argument("--instruction", default=None)
-    parser.add_argument("--model-action-mode", choices=("delta6_abs_gripper", "absolute"), default="delta6_abs_gripper")
+    parser.add_argument(
+        "--model-action-mode",
+        choices=("delta6_abs_gripper", "delta6_abs_gripper_forward", "absolute"),
+        default="delta6_abs_gripper",
+    )
     parser.add_argument("--output-action-format", choices=("cartesian_absolute",), default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--num-inference-steps", type=int, default=10)
