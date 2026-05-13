@@ -14,7 +14,7 @@ benchmark 的任务默认值已经抽到 YAML：
 
 | profile | YAML | AAO task | 模型输入 state | 模型输出 action | 相机映射 |
 | --- | --- | --- | --- | --- | --- |
-| `open_door_airbot_play_gs` | `configs/aao_benchmark/open_door_airbot_play_gs.yaml` | `open_door_airbot_play_gs` | 7D cartesian + gripper | 7D EEF pose + gripper | `head_left=env2_cam,right_wrist_left=eef_wrist_cam` |
+| `open_door_airbot_play_gs` | `configs/aao_benchmark/open_door_airbot_play_gs.yaml` | `open_door_airbot_play_gs` | 7D joint + gripper | 7D EEF pose + gripper | `head_left=env2_cam,right_wrist_left=eef_wrist_cam` |
 | `cup_on_coaster_gs_airbot_p7` | `configs/aao_benchmark/cup_on_coaster_gs_airbot_p7.yaml` | `cup_on_coaster_gs_airbot_p7` | 8D joint + gripper | 7D EEF pose + gripper | `head_left=env1_cam,right_wrist_left=eef_wrist_cam` |
 
 可以继续用内置名字：
@@ -43,7 +43,7 @@ camera_map: head_left=env2_cam,right_wrist_left=eef_wrist_cam
 action_repeat: 5
 train_action_hz: 20.0
 max_updates: 160
-proprio_mode: cartesian
+proprio_mode: joint
 proprio_dim: 7
 fastwam_config: configs/task/mix_uncond_2cam224_1e-4.yaml
 text_cache_dir: data/text_embeds_cache/mix
@@ -53,7 +53,13 @@ text_cache_dir: data/text_embeds_cache/mix
 
 - benchmark 统一向 AAO 下发 `cartesian_absolute`。AAO 的
   `apply_pose_action()` 期望的是绝对 EEF 目标位姿，不是相对量。
-- 不支持 `joint_absolute` 控制；cup 只是模型输入 state 使用 8D joint + gripper。
+- 不支持 `joint_absolute` 控制；open door 和 cup 都只把 joint + gripper
+  作为模型输入 state，输出动作仍统一转成 `cartesian_absolute` 下发。
+- 当前 real_1048、sim open door 以及 real+sim open door 训练数据的
+  `observation.state` 都是 arm joint + gripper，不是 EEF cartesian pose。
+  因此 open door profile 必须使用 `proprio_mode: joint`。如果误用
+  `cartesian`，模型会收到分布外 state，表现为闭环下发到 IK 难解区域或开门
+  不稳定。
 - 两个 profile 的模型输出都必须是 7D action。默认 `--model-action-mode
   delta6_abs_gripper` 对应当前 LeRobot 数据语义：前 6 维是帧对齐的 EEF
   实际增量 `pose[t] - pose[t-1]`，第 7 维是绝对 gripper target。

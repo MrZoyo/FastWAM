@@ -537,7 +537,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--action-repeat", type=int, default=5)
     parser.add_argument("--action-horizon", type=int, default=32)
     parser.add_argument("--action-format", choices=("cartesian_absolute", "joint_absolute"), default="cartesian_absolute")
-    parser.add_argument("--proprio-mode", choices=("cartesian", "joint"), default="cartesian")
+    parser.add_argument("--proprio-mode", choices=("cartesian", "joint"), default="joint")
     parser.add_argument("--train-action-hz", type=float, default=20.0)
     parser.add_argument("--gripper-min", type=float, default=None)
     parser.add_argument("--gripper-max", type=float, default=None)

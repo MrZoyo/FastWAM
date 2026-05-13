@@ -178,6 +178,34 @@
 - 更新后静态验证通过：
   - `.venv/bin/python -B -m py_compile ...`
   - `.venv/bin/python -B scripts/run_aao_closed_loop_eval.py --help`
+
+## 2026-05-13 闭环 state/proprio 问题定位
+
+- 现象：`real_sim_open_door_uncond_2cam224_1e-4_20k` 的模型在预测视频和离线 action
+  看起来正常，但用默认闭环跑 AAO open door 不稳定；同一数据集 episode 用
+  `scripts/replay_lerobot_action_to_aao.py` 从 MCAP 首帧初始化并直接 replay
+  数据集 action 可以开门成功。
+- 结论：闭环默认 `proprio_mode=cartesian` 是错误的。real_1048 和
+  sim open door 的 LeRobot `meta/info.json` 都明确写着
+  `observation.state` 是
+  `[right_arm_joint_0..right_arm_joint_5, right_gripper_position]`，不是
+  `[x,y,z,roll,pitch,yaw,gripper]`。
+- 影响：
+  - 模型条件输入收到分布外 state。
+  - 下发到 AAO 后表现为较多 IK failure 或只能转动把手、不能稳定开门。
+- 验证：
+  - 错误 cartesian proprio 跑 3 个 episode：
+    `runs/aao_closed_loop/real_sim_open_door_20k_gs_3ep_480_20260513/`，
+    AAO final_success 为 `1/3`。
+  - 只改 `--proprio-mode joint`，同 checkpoint/stats/action 语义/执行节奏跑
+    3 个 episode：
+    `runs/aao_closed_loop/real_sim_open_door_20k_gs_3ep_480_jointprop_20260513/`，
+    AAO final_success 为 `2/3`，说明主问题在 state/proprio 语义。
+- 已修正：
+  - `configs/aao_benchmark/open_door_airbot_play_gs.yaml` 改为
+    `proprio_mode: joint`。
+  - 单 episode runner 默认 `--proprio-mode joint`。
+  - open door sweep 和 visual rollout 脚本显式使用 `proprio_mode=joint`。
   - `.venv/bin/python -B scripts/run_aao_open_door_gs_sweep.py --help`
 - 频率控制验证通过：
   - `--sim-loop-frequency 0` + hold policy：记录 `control_mode=lockstep`，`error=null`。

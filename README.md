@@ -88,8 +88,10 @@ checkpoint is trained on already-forward deltas `pose[t+1] - pose[t]`, use
 `--model-action-mode delta6_abs_gripper_forward`.
 
 Both preset profiles use 7D EEF pose + gripper model actions. The cup profile
-uses 8D joint + gripper proprio as model input, but it does not use
-`joint_absolute` control. The cup checkpoint/profile is only validated for the
+uses 8D joint + gripper proprio as model input, and open-door checkpoints use
+6D arm joint + gripper proprio as model input. Neither profile uses
+`joint_absolute` control; actions are still sent as `cartesian_absolute`. The
+cup checkpoint/profile is only validated for the
 `cup_on_coaster_gs_airbot_p7` AAO task; do not override it to
 `cup_on_coaster_airbot_p7_umi` or other UMI v3 tasks. Batch benchmark currently
 supports lockstep only, that is `--sim-loop-frequency 0`. For multi-env and

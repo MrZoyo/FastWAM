@@ -237,7 +237,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 break
             window_start_model_step = model_steps_used
             window_start_sim_update = sim_updates_used
-            model_input = adapter.build_model_input(camera_map)
+            model_input = adapter.build_model_input(camera_map, proprio_mode=args.proprio_mode)
             response = client.infer_joint_video(
                 model_input,
                 num_video_frames=args.num_video_frames,
@@ -268,7 +268,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     obs = sim.get_observation()
                     observations = split_batched_observation(obs, sim.batch_size)
                     adapter.extend([observations[0]])
-                    last_actual_input = adapter.build_model_input(camera_map)
+                    last_actual_input = adapter.build_model_input(camera_map, proprio_mode=args.proprio_mode)
                     if args.frame_sampling == "sim-update":
                         local_progress = float(chunk_step_index) + float(repeat_index + 1) / float(args.action_repeat)
                         frame_entries.append(
@@ -449,6 +449,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--gripper-min", type=float, default=0.02)
     parser.add_argument("--gripper-max", type=float, default=0.0945)
+    parser.add_argument("--proprio-mode", choices=("cartesian", "joint"), default="joint")
     parser.add_argument("--video-fps", type=float, default=10.0)
     parser.add_argument("--test-action-consistency", action="store_true")
     parser.add_argument("--log-level", default="INFO")

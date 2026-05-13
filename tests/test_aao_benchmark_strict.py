@@ -63,7 +63,7 @@ def test_default_benchmark_profiles_load_from_yaml() -> None:
     open_door = _load_named_profile("open_door_airbot_play_gs")
     cup = _load_named_profile("cup_on_coaster_gs_airbot_p7")
     assert open_door.fastwam_config.endswith("configs/task/mix_uncond_2cam224_1e-4.yaml")
-    assert open_door.proprio_mode == "cartesian"
+    assert open_door.proprio_mode == "joint"
     assert cup.fastwam_config.endswith("configs/task/cup_uncond_2cam224_1e-4.yaml")
     assert cup.proprio_mode == "joint"
 

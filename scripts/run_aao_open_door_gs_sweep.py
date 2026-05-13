@@ -281,7 +281,7 @@ def _run_one(
 
             chunk_index = 0
             while updates_used < args.max_updates:
-                model_input = adapter.build_model_input(camera_map)
+                model_input = adapter.build_model_input(camera_map, proprio_mode=args.proprio_mode)
                 model_response = model_client.infer(model_input)
                 actions = _clamp_gripper(
                     _validated_actions(model_response, expected_format="cartesian_absolute", action_dim=7),
@@ -554,6 +554,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--gripper-min", type=float, default=0.02)
     parser.add_argument("--gripper-max", type=float, default=0.0945)
     parser.add_argument("--camera-map", default="head_left=env2_cam,right_wrist_left=eef_wrist_cam")
+    parser.add_argument("--proprio-mode", choices=("cartesian", "joint"), default="joint")
     parser.add_argument("--model-client", choices=("hold", "fastwam"), default="fastwam")
     parser.add_argument("--fastwam-config", default=str(DEFAULT_MIX_CONFIG))
     parser.add_argument("--checkpoint", default=str(DEFAULT_MIX_CKPT))
