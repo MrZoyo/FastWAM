@@ -128,13 +128,19 @@ def _compose_grid(
 
 
 def _model_view_pair(client: FastWAMModelClient, model_input: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-    views: list[np.ndarray] = []
-    for camera_key in client.image_shapes:
-        _, height, width = client.image_shapes[camera_key]
-        views.append(_resize_rgb(model_input["images"][camera_key], width=width, height=height))
-    if len(views) != 2:
-        raise RuntimeError(f"Visual rollout requires exactly two model cameras, got {len(views)}.")
-    return views[0], views[1]
+    # Show what the model actually sees: training-aligned preview, split horizontally.
+    if len(client.image_shapes) != 2:
+        raise RuntimeError(f"Visual rollout requires exactly two model cameras, got {len(client.image_shapes)}.")
+    if client.concat_multi_camera != "horizontal":
+        raise RuntimeError(
+            f"Visual rollout split assumes concat_multi_camera='horizontal', got {client.concat_multi_camera!r}."
+        )
+    preview = client.preview_uint8(model_input["images"])  # (H, W, 3) uint8
+    width = preview.shape[1]
+    if width % 2 != 0:
+        raise RuntimeError(f"Preview width must be even for horizontal split, got {width}.")
+    half = width // 2
+    return preview[:, :half], preview[:, half:]
 
 
 def _video_frame_index(

@@ -114,20 +114,10 @@ def _stereo_output_size(options: dict[str, Any], left_key: str, right_key: str) 
     output_size = options.get("output_size")
     if output_size is not None:
         return output_size
-    if _CLIENT is None:
-        return None
-    left_shape = _CLIENT.image_shapes.get(left_key)
-    right_shape = _CLIENT.image_shapes.get(right_key)
-    if left_shape is None or right_shape is None:
-        return None
-    left_size = (int(left_shape[2]), int(left_shape[1]))
-    right_size = (int(right_shape[2]), int(right_shape[1]))
-    if left_size != right_size:
-        raise ValueError(
-            f"Model image shapes for '{left_key}' and '{right_key}' must match for stereo undistort: "
-            f"{left_size} vs {right_size}"
-        )
-    return left_size
+    # Default to "native": undistort keeps the source resolution so it only performs
+    # distortion rectification. Downstream `FastWAMModelClient._preprocess_image` will
+    # apply the training-aligned aspect-preserving resize + center crop.
+    return "native"
 
 
 def _apply_optional_undistortion(
@@ -240,7 +230,7 @@ def _schema() -> dict[str, Any]:
             "undistort.left_to_right": "optional 4x4 transform or flattened 16 values for stereo rectification",
             "undistort.rotation": "optional 3x3 stereo rotation, alternative to left_to_right",
             "undistort.translation": "optional 3D stereo translation, alternative to left_to_right",
-            "undistort.output_size": "optional [width,height]; defaults to the model image size such as [224,224]",
+            "undistort.output_size": "optional [width,height] or 'native'; defaults to 'native' (source resolution) so the training-aligned resize/crop runs downstream",
             "undistort.alpha": "optional OpenCV free scaling parameter, default 0.0",
             "proprio_raw": "raw 7D real_1048 proprio vector [joint0..joint5, gripper]",
             "current_position": "optional 6D base position for delta accumulation; defaults to proprio_raw[:6]",
@@ -262,7 +252,7 @@ def _schema() -> dict[str, Any]:
                 "right_image_key": "right_wrist_left",
                 "left_camera_info": {"width": 1280, "height": 1088, "k": "[...]", "d": "[...]"},
                 "right_camera_info": {"width": 1280, "height": 1088, "k": "[...]", "d": "[...]"},
-                "output_size": [224, 224],
+                "output_size": "native",
             },
         },
     }

@@ -21,6 +21,11 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 
+from fastwam.datasets.dataset_utils import (
+    CenterCrop,
+    Normalize,
+    ResizeSmallestSideAspectPreserving,
+)
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 
@@ -217,6 +222,16 @@ class FastWAMModelClient(BaseModelClient):
         self.proprio_dim = int(self.data_cfg.shape_meta.state[0]["raw_shape"])
         self.model_action_dim = int(self.data_cfg.shape_meta.action[0]["raw_shape"])
 
+        # Image transforms mirroring RobotVideoDataset (training side):
+        # concat cameras at native resolution -> aspect-preserving resize -> center crop -> normalize.
+        self._image_resize_transform = ResizeSmallestSideAspectPreserving(
+            args={"img_w": int(self.video_size[1]), "img_h": int(self.video_size[0])}
+        )
+        self._image_crop_transform = CenterCrop(
+            args={"img_w": int(self.video_size[1]), "img_h": int(self.video_size[0])}
+        )
+        self._image_normalize_transform = Normalize(args={"mean": 0.5, "std": 0.5})
+
     def infer(self, model_input: dict[str, Any]) -> dict[str, Any]:
         return self.infer_batch([model_input])[0]
 
@@ -338,37 +353,48 @@ class FastWAMModelClient(BaseModelClient):
         image = torch.stack([self._preprocess_image(images) for images in images_batch], dim=0)
         return image.to(device=self.model.device, dtype=self.model.torch_dtype)
 
-    def _preprocess_image(self, images: dict[str, np.ndarray]) -> torch.Tensor:
+    def _stitch_cameras_native(self, images: dict[str, np.ndarray]) -> torch.Tensor:
+        """Concatenate per-camera RGB inputs at their native resolution.
+
+        Returns a uint8 tensor (C, H, W) where the spatial layout matches the training
+        pipeline (training calls torch.cat on the raw video frames before any resize).
+        """
         camera_tensors: list[torch.Tensor] = []
         for camera_key in self.image_shapes:
             if camera_key not in images:
                 raise RuntimeError(f"Missing FastWAM camera '{camera_key}' in model input.")
-            _, height, width = self.image_shapes[camera_key]
             rgb = np.asarray(images[camera_key], dtype=np.uint8)
             if rgb.ndim != 3 or rgb.shape[-1] != 3:
                 raise RuntimeError(f"FastWAM camera '{camera_key}' expected RGB shape [H,W,3], got {rgb.shape}.")
-            resized = Image.fromarray(rgb).resize((width, height), Image.BILINEAR)
-            arr = np.asarray(resized, dtype=np.float32)
-            tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+            tensor = torch.from_numpy(np.ascontiguousarray(rgb)).permute(2, 0, 1).contiguous()
             camera_tensors.append(tensor)
 
         if self.concat_multi_camera == "horizontal":
-            image = torch.cat(camera_tensors, dim=-1)
-        elif self.concat_multi_camera == "vertical":
-            image = torch.cat(camera_tensors, dim=-2)
-        elif len(camera_tensors) == 1:
-            image = camera_tensors[0]
-        else:
-            raise ValueError(f"Unsupported concat_multi_camera='{self.concat_multi_camera}'.")
+            return torch.cat(camera_tensors, dim=-1)
+        if self.concat_multi_camera == "vertical":
+            return torch.cat(camera_tensors, dim=-2)
+        if len(camera_tensors) == 1:
+            return camera_tensors[0]
+        raise ValueError(f"Unsupported concat_multi_camera='{self.concat_multi_camera}'.")
 
-        target_h, target_w = self.video_size
-        if tuple(image.shape[-2:]) != (target_h, target_w):
-            pil = Image.fromarray(image.permute(1, 2, 0).numpy().astype(np.uint8))
-            pil = pil.resize((target_w, target_h), Image.BILINEAR)
-            image = torch.from_numpy(np.asarray(pil, dtype=np.float32)).permute(2, 0, 1).contiguous()
+    def _preprocess_image(self, images: dict[str, np.ndarray]) -> torch.Tensor:
+        # Mirror RobotVideoDataset: concat at native res -> resize (keep aspect) -> center crop -> normalize.
+        image = self._stitch_cameras_native(images)
+        image = self._image_resize_transform(image)
+        image = self._image_crop_transform(image)
+        image = self._image_normalize_transform(image)
+        return image.contiguous()
 
-        image = image * (2.0 / 255.0) - 1.0
-        return image
+    def preview_uint8(self, images: dict[str, np.ndarray]) -> np.ndarray:
+        """Return the uint8 RGB view of the model input (training-aligned), shape (H, W, 3).
+
+        Useful for visualization scripts that want to show what the model actually sees,
+        without recomputing the resize/crop pipeline locally.
+        """
+        image = self._stitch_cameras_native(images)
+        image = self._image_resize_transform(image)
+        image = self._image_crop_transform(image)
+        return image.permute(1, 2, 0).contiguous().to(dtype=torch.uint8).numpy()
 
     def _normalize_proprio(self, proprio_raw: np.ndarray) -> torch.Tensor:
         proprio = torch.as_tensor(proprio_raw, dtype=torch.float32)

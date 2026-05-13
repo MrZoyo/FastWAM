@@ -81,29 +81,9 @@ def _sample_camera_images(sample: dict[str, Any], t: int) -> dict[str, np.ndarra
 
 
 def _composite_frame(images: dict[str, np.ndarray], client: FastWAMModelClient) -> Image.Image:
-    frames: list[np.ndarray] = []
-    resample = _pil_resample_bilinear()
-    for camera_key, shape in client.image_shapes.items():
-        if camera_key not in images:
-            raise KeyError(f"Missing camera key {camera_key}")
-        _, height, width = shape
-        frame = Image.fromarray(images[camera_key]).convert("RGB")
-        frame = frame.resize((width, height), resample)
-        frames.append(np.asarray(frame, dtype=np.uint8))
-
-    if client.concat_multi_camera == "horizontal":
-        arr = np.concatenate(frames, axis=1)
-    elif client.concat_multi_camera == "vertical":
-        arr = np.concatenate(frames, axis=0)
-    elif len(frames) == 1:
-        arr = frames[0]
-    else:
-        raise ValueError(f"Unsupported concat_multi_camera={client.concat_multi_camera!r}")
-
-    target_h, target_w = client.video_size
-    if arr.shape[:2] != (target_h, target_w):
-        arr = np.asarray(Image.fromarray(arr).resize((target_w, target_h), resample), dtype=np.uint8)
-    return Image.fromarray(arr)
+    # Use the training-aligned preview so the visualization reflects what the
+    # model actually sees (aspect-preserving resize + center crop).
+    return Image.fromarray(client.preview_uint8(images))
 
 
 def _gt_video_frames(
