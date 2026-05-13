@@ -1,0 +1,36 @@
+# @package _global_
+
+defaults:
+  - override /data: real_sim_open_door
+  - override /model: fastwam
+  - _self_
+
+# dataloading
+batch_size: 16
+num_workers: 8
+
+model:
+  mot_checkpoint_mixed_attn: false
+  skip_dit_load_from_pretrain: false
+  action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
+
+# scheduler
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 5
+max_steps: 20000
+log_every: 10
+save_every: 5000
+eval_every: 500
+
+# training
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null
+
+wandb:
+  enabled: true
+  project: fast-wam
+  name: real_sim_open_door_uncond_2cam224_1e-4_20k
+  group: real_sim_open_door
+  mode: online
