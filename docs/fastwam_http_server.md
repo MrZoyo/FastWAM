@@ -2,7 +2,19 @@
 
 The server loads one FastWAM checkpoint and exposes action chunk inference over JSON HTTP.
 It uses only the Python standard library for HTTP, so it does not require FastAPI or uvicorn.
-Optional stereo undistortion uses OpenCV if you send `undistort` calibration in the request.
+
+Incoming RGB frames are routed by their actual `(H, W)`:
+
+- **1088x1280** raw stereo frames: the payload **must** include an `undistort` object with
+  `left_camera_info` and `right_camera_info`. The server undistorts each eye at native
+  resolution, then resizes to `480x640` per camera with `cv2.INTER_AREA`. Requires OpenCV.
+- **480x640** training-aligned frames: passed through as-is. Any `undistort` field in the
+  payload is ignored. OpenCV is not required.
+- Any other resolution returns HTTP 400. All camera streams in a single request must share
+  the same resolution.
+
+Once images reach `480x640`, the model-side pipeline (short-side resize to 480, center-crop
+to `224x224`, normalize to `[-1, 1]`) runs unchanged.
 
 ## Prepare real_1048 Assets
 
@@ -60,23 +72,26 @@ PyTorch still reports the selected visible GPU as `cuda:0`.
 
 ## Endpoints
 
-- `GET /health`: model metadata, required camera keys, `proprio_dim`, horizon.
+- `GET /health`: model metadata, required camera keys, `proprio_dim`, horizon. Also reports
+  `accepted_image_resolutions=[[1088,1280],[480,640]]`, `undistort_required_at=[1088,1280]`,
+  and `resize_interpolation="cv2.INTER_AREA"`.
 - `GET /schema`: compact request/response schema.
 - `POST /infer`: run inference.
 - `POST /predict_action`: alias of `/infer`.
 
 ## POST /infer Request
 
+### Raw `1088x1280` stereo (requires `undistort` calibration)
+
 ```json
 {
   "instruction": "open the door",
   "images": {
-    "head_left": "<base64 encoded png/jpeg>",
-    "right_wrist_left": "<base64 encoded png/jpeg>"
+    "head_left": "<base64 encoded png/jpeg, 1088x1280>",
+    "right_wrist_left": "<base64 encoded png/jpeg, 1088x1280>"
   },
   "proprio_raw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04],
   "undistort": {
-    "enabled": true,
     "left_image_key": "head_left",
     "right_image_key": "right_wrist_left",
     "left_camera_info": {
@@ -91,9 +106,21 @@ PyTorch still reports the selected visible GPU as `cuda:0`.
       "k": [ ... ],
       "d": [ ... ]
     },
-    "output_size": [224, 224],
     "alpha": 0.0
   }
+}
+```
+
+### Already-aligned `480x640` frames
+
+```json
+{
+  "instruction": "open the door",
+  "images": {
+    "head_left": "<base64 encoded png/jpeg, 480x640>",
+    "right_wrist_left": "<base64 encoded png/jpeg, 480x640>"
+  },
+  "proprio_raw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04]
 }
 ```
 
@@ -102,22 +129,28 @@ PyTorch still reports the selected visible GPU as `cuda:0`.
 The server accumulates the predicted first six delta dimensions onto `proprio_raw[:6]` by default.
 You may pass `current_position`, `joint_position`, or `cartesian_position` as a 6D override if needed.
 
-If `undistort` is present, the server treats the two model images as a stereo pair, scales
-`CameraInfo.K` from the calibration resolution to the received image resolution, applies
-OpenCV stereo undistortion/rectification, and then resizes the result to the model-aligned
-output size. This means the client may send bandwidth-saving resized frames, such as
-`640x480`, while keeping `left_camera_info.width/height` and `right_camera_info.width/height`
-at the original calibration resolution. Distortion coefficients `d` are not scaled. If
-`output_size` is omitted, it defaults to the model image size, currently `[224, 224]` per
-camera.
+For the `1088x1280` path, the server treats the two model images as a stereo pair and runs
+OpenCV undistortion/rectification at **native resolution** (no `K` scaling — calibration must
+match the source resolution). Each eye is then resized to `480x640` with `cv2.INTER_AREA`
+before entering the training pipeline. `left_to_right` is optional: when provided, OpenCV
+performs stereo rectification; otherwise each eye is undistorted independently with its own
+`K`/`d`. The legacy fields `undistort.enabled` and `undistort.output_size` are no longer
+honored — they are silently ignored.
 
-`left_to_right` is optional. If it is provided, OpenCV uses stereo rectification; otherwise,
-the server undistorts the two eyes independently with their own intrinsics and distortion.
+For the `480x640` path, the server skips all OpenCV work; any `undistort` payload is ignored.
+This is the right choice if the client has already undistorted and resized upstream.
 
 `instruction` must have a matching precomputed text embedding in `--text-cache-dir`.
 If the cache is missing, the response is HTTP 500 with the missing cache path.
-Malformed requests, such as missing camera keys or a non-7D `proprio_raw`, return HTTP 400.
-If undistortion is requested but calibration is incomplete, the response is HTTP 400.
+
+The following malformed requests return HTTP 400:
+
+- non-7D `proprio_raw` or missing camera keys
+- images at a resolution other than `1088x1280` or `480x640`
+- cameras in the same request with mismatched resolutions
+- `1088x1280` images without an `undistort` object, or with `left_camera_info` /
+  `right_camera_info` missing
+- image bytes that are not `H x W x 3` `uint8` after base64 decoding
 
 ## Response
 

@@ -16,6 +16,13 @@ POST /infer expects JSON:
     "images": {"head_left": "<base64 png/jpeg>", "right_wrist_left": "<base64 png/jpeg>"},
     "proprio_raw": [q0, q1, q2, q3, q4, q5, gripper]
   }
+
+Images must be either (H=1088, W=1280) raw frames (the payload then MUST
+include an "undistort" object with left_camera_info / right_camera_info, and
+the server undistorts at native resolution before resizing each camera to
+480x640 with cv2.INTER_AREA) or (H=480, W=640) frames already aligned with
+training (no undistort, no resize). All camera streams in a single request
+must share the same resolution; any other resolution returns 400.
 """
 
 from __future__ import annotations
@@ -40,7 +47,11 @@ if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from fastwam.closed_loop_eval.model_clients import FastWAMModelClient
-from fastwam.utils.rgb_undistort import opencv_available, undistort_stereo_side_from_camera_info
+from fastwam.utils.rgb_undistort import (
+    _require_cv2,
+    opencv_available,
+    undistort_stereo_side_from_camera_info,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -48,6 +59,9 @@ logger = logging.getLogger(__name__)
 _CLIENT: FastWAMModelClient | None = None
 _INFER_LOCK = threading.Lock()
 _SERVER_INFO: dict[str, Any] = {}
+
+_NATIVE_SHAPE: tuple[int, int] = (1088, 1280)  # (H, W) raw stereo frames
+_TRAIN_SHAPE: tuple[int, int] = (480, 640)     # (H, W) training-aligned frames
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -76,25 +90,13 @@ def _decode_image(value: Any) -> np.ndarray:
         raise ValueError(f"Invalid base64 image: {exc}") from exc
 
 
-def _bool_value(value: Any, *, default: bool = False) -> bool:
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-    return bool(value)
-
-
-def _undistort_config(payload: dict[str, Any]) -> dict[str, Any] | None:
-    value = payload.get("undistort")
-    if value is None or value is False:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("Field 'undistort' must be an object when enabled.")
-    if not _bool_value(value.get("enabled"), default=True):
-        return None
-    return value
+def _image_hw(arr: np.ndarray) -> tuple[int, int]:
+    if not isinstance(arr, np.ndarray) or arr.ndim != 3 or arr.shape[2] != 3 or arr.dtype != np.uint8:
+        raise ValueError(
+            f"Each image must be H x W x 3 uint8; got shape={getattr(arr, 'shape', None)} "
+            f"dtype={getattr(arr, 'dtype', None)}."
+        )
+    return int(arr.shape[0]), int(arr.shape[1])
 
 
 def _stereo_image_keys(options: dict[str, Any]) -> tuple[str, str]:
@@ -106,64 +108,85 @@ def _stereo_image_keys(options: dict[str, Any]) -> tuple[str, str]:
         raise RuntimeError("Model is not initialized.")
     keys = list(_CLIENT.image_shapes.keys())
     if len(keys) != 2:
-        raise ValueError("undistort requires left_image_key/right_image_key when the model uses more than 2 images.")
+        raise ValueError(
+            "undistort requires left_image_key/right_image_key when the model uses more than 2 images."
+        )
     return keys[0], keys[1]
 
 
-def _stereo_output_size(options: dict[str, Any], left_key: str, right_key: str) -> tuple[int, int] | str | None:
-    output_size = options.get("output_size")
-    if output_size is not None:
-        return output_size
-    # Default to "native": undistort keeps the source resolution so it only performs
-    # distortion rectification. Downstream `FastWAMModelClient._preprocess_image` will
-    # apply the training-aligned aspect-preserving resize + center crop.
-    return "native"
-
-
-def _apply_optional_undistortion(
+def _normalize_image_resolution(
     *,
     images: dict[str, np.ndarray],
     payload: dict[str, Any],
 ) -> dict[str, np.ndarray]:
-    options = _undistort_config(payload)
-    if options is None:
+    """Branch on the actual (H, W) of incoming images.
+
+    - 1088x1280: require stereo calibration, undistort at native resolution, then
+      cv2.resize each camera down to 480x640 with INTER_AREA.
+    - 480x640:   pass through; any 'undistort' field in the payload is ignored.
+    - other:     raise ValueError -> the handler turns it into a 400.
+    """
+    shapes = {k: _image_hw(v) for k, v in images.items()}
+    unique = set(shapes.values())
+    if len(unique) != 1:
+        raise ValueError(f"All images must share the same (H, W); got {shapes}.")
+    hw = next(iter(unique))
+
+    if hw == _TRAIN_SHAPE:
         return images
 
-    left_key, right_key = _stereo_image_keys(options)
-    if left_key not in images or right_key not in images:
-        raise ValueError(f"Field 'images' must contain stereo keys '{left_key}' and '{right_key}'.")
+    if hw == _NATIVE_SHAPE:
+        options = payload.get("undistort")
+        if not isinstance(options, dict):
+            raise ValueError(
+                "Images at 1088x1280 require an 'undistort' object with "
+                "left_camera_info/right_camera_info for native-resolution undistortion."
+            )
+        left_key, right_key = _stereo_image_keys(options)
+        if left_key not in images or right_key not in images:
+            raise ValueError(
+                f"Field 'images' must contain stereo keys '{left_key}' and '{right_key}'."
+            )
+        left_ci = options.get("left_camera_info")
+        right_ci = options.get("right_camera_info")
+        if not isinstance(left_ci, dict) or not isinstance(right_ci, dict):
+            raise ValueError(
+                "Field 'undistort' must provide 'left_camera_info' and "
+                "'right_camera_info' objects when images are 1088x1280."
+            )
+        leftover = [k for k in images if k not in (left_key, right_key)]
+        if leftover:
+            raise ValueError(
+                f"Image keys {leftover} are 1088x1280 but not designated as "
+                "left/right stereo; cannot undistort."
+            )
 
-    left_camera_info = options.get("left_camera_info")
-    right_camera_info = options.get("right_camera_info")
-    if not isinstance(left_camera_info, dict) or not isinstance(right_camera_info, dict):
-        raise ValueError("Field 'undistort' must provide 'left_camera_info' and 'right_camera_info' objects.")
+        cv = _require_cv2()
+        kwargs = dict(
+            left_camera_info=left_ci,
+            right_camera_info=right_ci,
+            output_size="native",
+            left_to_right=options.get("left_to_right"),
+            rotation=options.get("rotation"),
+            translation=options.get("translation"),
+            alpha=float(options.get("alpha", 0.0)),
+        )
+        out = dict(images)
+        out[left_key] = undistort_stereo_side_from_camera_info(
+            rgb=images[left_key], eye="left", **kwargs
+        )
+        out[right_key] = undistort_stereo_side_from_camera_info(
+            rgb=images[right_key], eye="right", **kwargs
+        )
+        target_wh = (_TRAIN_SHAPE[1], _TRAIN_SHAPE[0])  # cv2.resize takes (W, H)
+        for k in (left_key, right_key):
+            out[k] = cv.resize(out[k], target_wh, interpolation=cv.INTER_AREA)
+        return out
 
-    output_size = _stereo_output_size(options, left_key, right_key)
-    alpha = float(options.get("alpha", 0.0))
-    output = dict(images)
-    output[left_key] = undistort_stereo_side_from_camera_info(
-        rgb=images[left_key],
-        left_camera_info=left_camera_info,
-        right_camera_info=right_camera_info,
-        output_size=output_size,
-        left_to_right=options.get("left_to_right"),
-        rotation=options.get("rotation"),
-        translation=options.get("translation"),
-        alpha=alpha,
-        eye="left",
+    raise ValueError(
+        f"Unsupported image resolution (H, W)={hw}; expected "
+        f"{_NATIVE_SHAPE} (with stereo calibration) or {_TRAIN_SHAPE}."
     )
-    output[right_key] = undistort_stereo_side_from_camera_info(
-        rgb=images[right_key],
-        left_camera_info=left_camera_info,
-        right_camera_info=right_camera_info,
-        output_size=output_size,
-        left_to_right=options.get("left_to_right"),
-        rotation=options.get("rotation"),
-        translation=options.get("translation"),
-        alpha=alpha,
-        eye="right",
-    )
-    return output
 
 
 def _require_array(payload: dict[str, Any], key: str) -> np.ndarray:
@@ -188,7 +211,7 @@ def _request_to_model_input(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"Missing required image keys: {missing}.")
 
     images = {str(key): _decode_image(value) for key, value in images_payload.items()}
-    images = _apply_optional_undistortion(images=images, payload=payload)
+    images = _normalize_image_resolution(images=images, payload=payload)
     proprio_raw = _require_array(payload, "proprio_raw")
     if _CLIENT is not None and proprio_raw.size != _CLIENT.proprio_dim:
         raise ValueError(f"Field 'proprio_raw' must have length {_CLIENT.proprio_dim}, got {proprio_raw.size}.")
@@ -221,8 +244,16 @@ def _schema() -> dict[str, Any]:
         },
         "request": {
             "instruction": "optional string; must have a matching text cache when text encoder is not loaded",
-            "images": "object mapping training camera keys to base64 encoded PNG/JPEG RGB images",
-            "undistort": "optional object with stereo calibration; when present, images are undistorted before resize",
+            "images": (
+                "object mapping training camera keys to base64 PNG/JPEG RGB images; "
+                "all cameras must share the same resolution, either 1088x1280 (raw, "
+                "requires 'undistort' calibration) or 480x640 (already training-aligned)"
+            ),
+            "undistort": (
+                "required when images are 1088x1280; ignored when images are 480x640. "
+                "Stereo calibration object used to undistort at native resolution before "
+                "the server resizes each camera to 480x640 with cv2.INTER_AREA."
+            ),
             "undistort.left_image_key": "optional image key for the left stereo frame; defaults to the first model key",
             "undistort.right_image_key": "optional image key for the right stereo frame; defaults to the second model key",
             "undistort.left_camera_info": "required CameraInfo-style object for the left camera",
@@ -230,7 +261,6 @@ def _schema() -> dict[str, Any]:
             "undistort.left_to_right": "optional 4x4 transform or flattened 16 values for stereo rectification",
             "undistort.rotation": "optional 3x3 stereo rotation, alternative to left_to_right",
             "undistort.translation": "optional 3D stereo translation, alternative to left_to_right",
-            "undistort.output_size": "optional [width,height] or 'native'; defaults to 'native' (source resolution) so the training-aligned resize/crop runs downstream",
             "undistort.alpha": "optional OpenCV free scaling parameter, default 0.0",
             "proprio_raw": "raw 7D real_1048 proprio vector [joint0..joint5, gripper]",
             "current_position": "optional 6D base position for delta accumulation; defaults to proprio_raw[:6]",
@@ -247,12 +277,10 @@ def _schema() -> dict[str, Any]:
             "images": {"head_left": "<base64>", "right_wrist_left": "<base64>"},
             "proprio_raw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04],
             "undistort": {
-                "enabled": True,
                 "left_image_key": "head_left",
                 "right_image_key": "right_wrist_left",
                 "left_camera_info": {"width": 1280, "height": 1088, "k": "[...]", "d": "[...]"},
                 "right_camera_info": {"width": 1280, "height": 1088, "k": "[...]", "d": "[...]"},
-                "output_size": "native",
             },
         },
     }
@@ -375,6 +403,9 @@ def main(argv: list[str] | None = None) -> None:
         "num_inference_steps": _CLIENT.num_inference_steps,
         "device": _CLIENT.device,
         "opencv_available": opencv_available(),
+        "accepted_image_resolutions": [list(_NATIVE_SHAPE), list(_TRAIN_SHAPE)],
+        "undistort_required_at": list(_NATIVE_SHAPE),
+        "resize_interpolation": "cv2.INTER_AREA",
     }
 
     httpd = ThreadingHTTPServer((args.host, args.port), FastWAMHandler)
