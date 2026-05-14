@@ -1,7 +1,7 @@
 train:
   _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
   dataset_dirs:
-    - /DATA/disk1/zoyo/real_1048
+    - /DATA/disk1/zoyo/real_1048_crop
   shape_meta:
     images:
       - key: head_left
@@ -54,13 +54,13 @@ train:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
         size: [224, 224]
-  text_embedding_cache_dir: ./data/text_embeds_cache/real_1048
+  text_embedding_cache_dir: ./data/text_embeds_cache/real_1048_crop
   context_len: 128
 
 val:
   _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
   dataset_dirs:
-    - /DATA/disk1/zoyo/real_1048
+    - /DATA/disk1/zoyo/real_1048_crop
   shape_meta:
     images:
       - key: head_left
@@ -113,5 +113,5 @@ val:
       - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
       - _target_: torchvision.transforms.Resize
         size: [224, 224]
-  text_embedding_cache_dir: ./data/text_embeds_cache/real_1048
+  text_embedding_cache_dir: ./data/text_embeds_cache/real_1048_crop
   context_len: 128
