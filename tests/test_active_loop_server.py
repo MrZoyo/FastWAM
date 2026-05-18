@@ -225,6 +225,24 @@ def test_argparser_removed_v1_flags_absent():
             p.parse_args([bad, "x"])
 
 
+def test_emergency_on_failure_default_true():
+    """PR10: --emergency-on-failure defaults to True (safe-by-default)."""
+    ns = als.build_argparser().parse_args([])
+    assert ns.emergency_on_failure is True
+
+
+def test_emergency_on_failure_explicit_true():
+    """PR10: passing --emergency-on-failure keeps it True."""
+    ns = als.build_argparser().parse_args(["--emergency-on-failure"])
+    assert ns.emergency_on_failure is True
+
+
+def test_emergency_on_failure_disable():
+    """PR10: --no-emergency-on-failure (BooleanOptionalAction) turns it off."""
+    ns = als.build_argparser().parse_args(["--no-emergency-on-failure"])
+    assert ns.emergency_on_failure is False
+
+
 # ---------------------------------------------------------------------------
 # HTTP endpoints
 # ---------------------------------------------------------------------------

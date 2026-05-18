@@ -83,7 +83,14 @@ _FLAGS: list[tuple[str, dict[str, Any]]] = [
     ("--num-inference-steps", {"type": int, "default": None}),
     ("--chunk-max-stale-ms", {"type": int, "default": 2000}),
     ("--auto-dispatch", {"action": "store_true", "default": False}),
-    ("--emergency-on-failure", {"action": "store_true", "default": True}),
+    ("--emergency-on-failure", {
+        "action": argparse.BooleanOptionalAction,
+        "default": True,
+        "help": (
+            "If True, watchdog/dispatcher trip set_arm_emergency_stop on hard fault. "
+            "Pass --no-emergency-on-failure to disable (e.g. for dry-run smoke)."
+        ),
+    }),
     ("--watchdog-period-ms", {"type": int, "default": 10}),
     ("--instruction", {"default": DEFAULT_INSTRUCTION}),
     ("--device", {"default": "cuda:1"}),
