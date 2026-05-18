@@ -47,6 +47,7 @@ if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from fastwam.closed_loop_eval.model_clients import FastWAMModelClient
+from fastwam.server.image_pipeline import undistort_native
 from fastwam.utils.rgb_undistort import (
     _require_cv2,
     opencv_available,
@@ -232,21 +233,14 @@ def _normalize_image_resolution(
             )
 
         cv = _require_cv2()
-        kwargs = dict(
-            left_camera_info=left_ci,
-            right_camera_info=right_ci,
-            output_size="native",
+        out = undistort_native(
+            images,
+            default_camera_info={left_key: left_ci, right_key: right_ci},
+            stereo_pair={"left": left_key, "right": right_key},
+            alpha=float(options.get("alpha", 0.0)),
             left_to_right=options.get("left_to_right"),
             rotation=options.get("rotation"),
             translation=options.get("translation"),
-            alpha=float(options.get("alpha", 0.0)),
-        )
-        out = dict(images)
-        out[left_key] = undistort_stereo_side_from_camera_info(
-            rgb=images[left_key], eye="left", **kwargs
-        )
-        out[right_key] = undistort_stereo_side_from_camera_info(
-            rgb=images[right_key], eye="right", **kwargs
         )
         target_wh = (_TRAIN_SHAPE[1], _TRAIN_SHAPE[0])  # cv2.resize takes (W, H)
         for k in (left_key, right_key):
