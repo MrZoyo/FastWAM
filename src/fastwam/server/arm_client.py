@@ -4,6 +4,12 @@ PR4 scope: background poller that reads joint / EEF / end_pose RPCs, exposes
 the latest snapshot, and converts target poses to SDK CartesianPose for
 ``move_end_pose``. Quaternion sign is unwrapped against the previous sample.
 
+PR8 scope: ``acquire_control`` now also switches the controller to
+``servo_control`` and configures per-joint arm speed (guide §1). ``send_pose``
+issues a single ``move_end_pose`` per tick with the gripper target carried in
+``ArmControlOptions.eef_pos`` — calling ``move_eef`` separately would interrupt
+the previous pose command (SDK PDF p.31 / guide §4.1).
+
 The lease is fully delegated to ``AirbotClient.acquire_control`` — its built-in
 ``_lease_thread`` auto-renews on the SDK side, so we never start our own
 timer (design doc risk #7).
@@ -62,6 +68,7 @@ class ArmClient:
         lease_ms: int,
         logger: Optional[logging.Logger] = None,
         *,
+        arm_speed_rad_s: float = 0.5,
         client_factory: Optional[Any] = None,
     ) -> None:
         if poll_hz <= 0:
@@ -78,6 +85,10 @@ class ArmClient:
         self._state_max_age_ns = int(state_max_age_ms * 1e6)
         self._lease_ms = int(lease_ms)
         self._logger = logger or logging.getLogger(__name__)
+        # arm_speed in rad/s per joint; servo_control needs an explicit cap.
+        # 0.5 rad/s (~28.6 deg/s) is the conservative default suggested by
+        # the ArmClient guide §1 (set_arm_speed call right after switch_controller).
+        self._arm_speed_rad_s = float(arm_speed_rad_s)
 
         # Allow tests to inject a fake SDK client without monkeypatching imports.
         if client_factory is None:
@@ -153,6 +164,12 @@ class ArmClient:
     # lease / control
     # ------------------------------------------------------------------
     def acquire_control(self) -> bool:
+        """Acquire lease, switch to servo_control, set arm speed.
+
+        servo_control is required for streaming 20 Hz pose targets via
+        ``move_end_pose`` (guide §1, SDK PDF p.21). On any failure after
+        ``acquire_control`` succeeds we release the lease before returning.
+        """
         if self._client is None:
             raise RuntimeError("ArmClient.acquire_control before start()")
         ok = bool(
@@ -160,8 +177,42 @@ class ArmClient:
                 lease_ms=self._lease_ms, renew_period_s=5.0
             )
         )
-        self._acquired = ok
-        return ok
+        if not ok:
+            self._logger.error("[arm] acquire_control returned False")
+            self._acquired = False
+            return False
+        # Lazy import the Controller enum so tests can keep arm_sdk fully stubbed.
+        try:
+            from arm_sdk.client import Controller as _Controller
+        except Exception:  # pragma: no cover - only in stub envs
+            _Controller = getattr(self._client, "_controller_enum", None)
+        if _Controller is not None and hasattr(self._client, "switch_controller"):
+            switched = bool(
+                self._client.switch_controller(_Controller.servo_control)
+            )
+            if not switched:
+                self._logger.error(
+                    "[arm] switch_controller(servo_control) returned False"
+                )
+                try:
+                    self._client.release_control()
+                finally:
+                    self._acquired = False
+                return False
+            self._logger.info("[arm] switched to servo_control")
+        if hasattr(self._client, "set_arm_speed"):
+            try:
+                self._client.set_arm_speed([self._arm_speed_rad_s] * 6)
+                self._logger.info(
+                    "[arm] set_arm_speed=%.3f rad/s per joint",
+                    self._arm_speed_rad_s,
+                )
+            except Exception:  # pragma: no cover - best-effort
+                self._logger.exception(
+                    "[arm] set_arm_speed raised; continuing"
+                )
+        self._acquired = True
+        return True
 
     def release_control(self) -> None:
         if self._client is None:
@@ -244,14 +295,14 @@ class ArmClient:
             ),
         )
         opts = self._opts_cls()  # blocking=False by default
-        ok_pose = bool(self._client.move_end_pose(pose, opts))
-        if not ok_pose:
-            raise ArmSdkError("move_end_pose returned False")
-
+        # Gripper rides inside opts.eef_pos so that pose + gripper update is
+        # a single RPC. Calling move_eef separately would interrupt the
+        # previous move_end_pose (SDK PDF p.31 / guide §4.1).
         if gripper_m is not None:
-            ok_eef = bool(self._client.move_eef(float(gripper_m), opts))
-            if not ok_eef:
-                raise ArmSdkError("move_eef returned False")
+            opts.eef_pos = float(gripper_m)
+        ok = bool(self._client.move_end_pose(pose, opts))
+        if not ok:
+            raise ArmSdkError("move_end_pose returned False")
         return True
 
     # ------------------------------------------------------------------

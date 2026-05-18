@@ -39,10 +39,11 @@ class _CartesianPoseStub:
 
 
 class _OptionsStub:
-    """Mirror of ArmControlOptions: only ``blocking`` is asserted in tests."""
+    """Mirror of ArmControlOptions: ``blocking`` + ``eef_pos`` are asserted."""
 
     def __init__(self):
         self.blocking = False
+        self.eef_pos = 0.0
 
 
 def _make_mock_sdk_client(
@@ -62,6 +63,8 @@ def _make_mock_sdk_client(
     c.move_eef.return_value = True
     c.set_arm_emergency_stop.return_value = True
     c.acquire_control.return_value = True
+    c.switch_controller.return_value = True
+    c.set_arm_speed.return_value = None
     c.release_control.return_value = None
     c.close.return_value = None
     c._lease_id = None
@@ -105,7 +108,7 @@ def _make_client(mock_sdk, **overrides):
 # ---------------------------------------------------------------------------
 # send_pose conversion chain
 # ---------------------------------------------------------------------------
-def test_send_pose_converts_rpy_to_quat_and_calls_move_eef():
+def test_send_pose_converts_rpy_to_quat_and_packs_gripper_in_opts():
     mock_sdk = _make_mock_sdk_client()
     arm = _make_client(mock_sdk)
     arm._test_start()
@@ -115,13 +118,17 @@ def test_send_pose_converts_rpy_to_quat_and_calls_move_eef():
         ok = arm.send_pose(xyz, rpy, gripper_m=0.05)
         assert ok is True
 
+        # PR8: a single move_end_pose RPC carries both pose and gripper.
         assert mock_sdk.move_end_pose.call_count == 1
+        assert mock_sdk.move_eef.call_count == 0
+
         call = mock_sdk.move_end_pose.call_args
         pose_arg = call.args[0]
         opts_arg = call.args[1]
         assert isinstance(pose_arg, _CartesianPoseStub)
         assert isinstance(opts_arg, _OptionsStub)
         assert opts_arg.blocking is False
+        assert opts_arg.eef_pos == pytest.approx(0.05)
 
         # position passed through verbatim
         np.testing.assert_allclose(pose_arg.position, (0.3, 0.0, 0.25), atol=1e-7)
@@ -129,16 +136,11 @@ def test_send_pose_converts_rpy_to_quat_and_calls_move_eef():
         # quaternion matches scipy ground truth
         expected_quat = R.from_euler("xyz", rpy, degrees=False).as_quat()
         np.testing.assert_allclose(pose_arg.orientation, expected_quat, atol=1e-6)
-
-        assert mock_sdk.move_eef.call_count == 1
-        eef_call = mock_sdk.move_eef.call_args
-        assert eef_call.args[0] == pytest.approx(0.05)
-        assert isinstance(eef_call.args[1], _OptionsStub)
     finally:
         arm.stop()
 
 
-def test_send_pose_without_gripper_skips_move_eef():
+def test_send_pose_without_gripper_leaves_opts_eef_pos_default():
     mock_sdk = _make_mock_sdk_client()
     arm = _make_client(mock_sdk)
     arm._test_start()
@@ -146,6 +148,9 @@ def test_send_pose_without_gripper_skips_move_eef():
         arm.send_pose(np.zeros(3), np.zeros(3), gripper_m=None)
         assert mock_sdk.move_end_pose.call_count == 1
         assert mock_sdk.move_eef.call_count == 0
+        opts_arg = mock_sdk.move_end_pose.call_args.args[1]
+        # opts.eef_pos must stay at the stub's default (0.0) when no gripper.
+        assert opts_arg.eef_pos == pytest.approx(0.0)
     finally:
         arm.stop()
 
@@ -158,20 +163,8 @@ def test_send_pose_raises_on_move_end_pose_false():
     try:
         with pytest.raises(ArmSdkError):
             arm.send_pose(np.zeros(3), np.zeros(3), gripper_m=0.05)
-        # move_eef must not be called after move_end_pose fails
+        # PR8: move_eef is never called in the new single-RPC path.
         assert mock_sdk.move_eef.call_count == 0
-    finally:
-        arm.stop()
-
-
-def test_send_pose_raises_on_move_eef_false():
-    mock_sdk = _make_mock_sdk_client()
-    mock_sdk.move_eef.return_value = False
-    arm = _make_client(mock_sdk)
-    arm._test_start()
-    try:
-        with pytest.raises(ArmSdkError):
-            arm.send_pose(np.zeros(3), np.zeros(3), gripper_m=0.05)
     finally:
         arm.stop()
 
@@ -341,11 +334,72 @@ def test_acquire_release_and_emergency_forward_to_sdk():
         mock_sdk.acquire_control.assert_called_once_with(
             lease_ms=15000, renew_period_s=5.0
         )
+        # PR8: switch_controller(servo_control) + set_arm_speed must follow.
+        from arm_sdk.client import Controller as _Controller
+        mock_sdk.switch_controller.assert_called_once_with(
+            _Controller.servo_control
+        )
+        mock_sdk.set_arm_speed.assert_called_once_with([0.5] * 6)
 
         arm.emergency_stop(True)
         mock_sdk.set_arm_emergency_stop.assert_called_with(True)
 
         arm.release_control()
         mock_sdk.release_control.assert_called()
+    finally:
+        arm.stop()
+
+
+def test_acquire_control_switches_to_servo_and_sets_speed_custom():
+    """Custom arm_speed_rad_s flows through to set_arm_speed unchanged."""
+    mock_sdk = _make_mock_sdk_client()
+    arm = _make_client(mock_sdk, arm_speed_rad_s=0.8)
+    arm._test_start()
+    try:
+        from arm_sdk.client import Controller as _Controller
+        assert arm.acquire_control() is True
+
+        # Verify call order: acquire_control -> switch_controller -> set_arm_speed.
+        names = [c[0] for c in mock_sdk.method_calls if c[0] in (
+            "acquire_control", "switch_controller", "set_arm_speed",
+        )]
+        assert names == ["acquire_control", "switch_controller", "set_arm_speed"], names
+        mock_sdk.switch_controller.assert_called_once_with(
+            _Controller.servo_control
+        )
+        mock_sdk.set_arm_speed.assert_called_once_with([0.8] * 6)
+    finally:
+        arm.stop()
+
+
+def test_acquire_control_switch_failure_releases_lease():
+    mock_sdk = _make_mock_sdk_client()
+    mock_sdk.switch_controller.return_value = False
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        assert arm.acquire_control() is False
+        mock_sdk.acquire_control.assert_called_once()
+        mock_sdk.switch_controller.assert_called_once()
+        # On switch failure we must release the lease and not call set_arm_speed.
+        mock_sdk.release_control.assert_called_once()
+        mock_sdk.set_arm_speed.assert_not_called()
+        assert arm._acquired is False
+    finally:
+        arm.stop()
+
+
+def test_acquire_control_acquire_returns_false_skips_switch():
+    mock_sdk = _make_mock_sdk_client()
+    mock_sdk.acquire_control.return_value = False
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        assert arm.acquire_control() is False
+        # When lease is not granted, no controller switch / speed set should happen.
+        mock_sdk.switch_controller.assert_not_called()
+        mock_sdk.set_arm_speed.assert_not_called()
+        mock_sdk.release_control.assert_not_called()
+        assert arm._acquired is False
     finally:
         arm.stop()
