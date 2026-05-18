@@ -63,7 +63,7 @@ _FLAGS: list[tuple[str, dict[str, Any]]] = [
     ("--dataset-stats", {"default": "runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/dataset_stats.json"}),
     ("--text-cache-dir", {"default": "data/text_embeds_cache/real_1048"}),
     ("--default-camera-info", {"default": "configs/camera_info/real_1048_default.json"}),
-    ("--ws-url", {"default": "ws://192.168.31.66:19095"}),
+    ("--ws-url", {"default": "ws://192.168.31.67:19095"}),
     ("--ws-frame-max-age-ms", {"type": int, "default": 250}),
     ("--ws-reconnect-backoff-ms", {"default": "500,1000,2000,5000,10000"}),
     ("--ws-startup-timeout-ms", {"type": int, "default": 30_000}),

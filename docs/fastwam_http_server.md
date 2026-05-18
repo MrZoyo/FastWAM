@@ -284,9 +284,20 @@ estop you MUST call `POST /emergency {"enable": false}` before the next
 ### `GET /health`
 
 Returns `{"status": "ok", "server": "fastwam_active_loop_server", "arm":
-arm.health(), "ws": ws.health()}`. `arm.health()` includes
-`lease_alive`, `last_poll_age_ms`, `consecutive_fail`. `ws.health()` includes
-`last_frame_age_per_channel_ms`, `fps_5s`, `decode_fail_count`, etc.
+arm.health(), "ws": ws.health()}`.
+
+`arm.health()` fields:
+
+- `status` — `"GREEN"` / `"YELLOW"` / `"RED"`. `worst = max(consecutive_fail, consecutive_send_fail)`; `>=5` → RED, `>=3` → YELLOW, else GREEN. Lease lost (`lease_alive==False` while `_acquired==True`) is hard RED.
+- `consecutive_fail` — read-RPC poller failure streak.
+- `consecutive_send_fail` — `send_pose` failure streak (cleared on success).
+- `last_poll_age_ms` — age of the cached `ArmStateSnapshot`.
+- `lease_alive` — whether SDK's internal `_lease_id` is still set.
+- `lease_renew_count` — number of successful auto-reacquires triggered by `send_pose` lease-loss detection (PR11 R15).
+- `last_quat_unwrap_count` — how many times the poller had to sign-flip a quat.
+- `running` — poller thread alive.
+
+`ws.health()` fields: `last_frame_age_per_channel_ms`, `fps_5s`, `decode_fail_count`, `reconnect_count`, `pair_seq_gaps`.
 
 ### `GET /closed_loop_status`
 
@@ -300,16 +311,20 @@ last reconnect reason). Useful for debugging dropped frames.
 
 ### `POST /debug/zero_pose_test`
 
-Body: `{"duration_s": 5.0}`. Reads `arm.latest()`, builds a 32-frame chunk
-where every row is `[x, y, z, roll, pitch, yaw, gripper] = current EEF
-pose`, and injects it directly into the dispatcher (bypassing the model).
-The arm MUST NOT move. Any observed pose drift means the coordinate-system
-plumbing in `arm_client.send_pose` or the dispatcher's blend-and-extend is
-wrong; abort and fix the conversion before proceeding to a real `/start`.
+Body: `{"duration_s": 5.0}` (range 0–60). Reads `arm.latest()`, builds a
+32-frame chunk where every row is `[x, y, z, roll, pitch, yaw, gripper] =
+current EEF pose`, and injects it directly into the dispatcher (bypassing
+the model). The arm MUST NOT move. Any observed pose drift means the
+coordinate-system plumbing in `arm_client.send_pose` or the dispatcher's
+blend-and-extend is wrong; abort and fix the conversion before proceeding
+to a real `/start`.
 
-Internally calls `runner.start(None)` followed by
-`runner.inject_chunk_for_debug(action_abs, base_ts_ns)` (the latter ships
-with PR5). Returns 503 if no fresh `arm.latest()` is available.
+Internally (PR9 R4): acquires control, injects the synthetic chunk,
+starts **only** the dispatcher (`runner.start_dispatch_only()`, no
+InferLoop / no Watchdog so the model cannot overwrite the zero chunk),
+sleeps `duration_s`, then stops the dispatcher and releases the lease.
+Response status: `"zero_pose_completed"`. Returns 503 if no fresh
+`arm.latest()` is available or `arm.acquire_control` fails.
 
 ## Bring-up Checklist (mandatory before real `/start`)
 
@@ -376,7 +391,7 @@ percentiles. Any of the following abort the launch with `exit(1)`:
 | `--dataset-stats` | `runs/.../dataset_stats.json` | Normalizer stats path |
 | `--text-cache-dir` | `data/text_embeds_cache/real_1048` | Pre-computed text embed cache |
 | `--default-camera-info` | `configs/camera_info/real_1048_default.json` | Per-camera intrinsics for undistort |
-| `--ws-url` | `ws://192.168.31.66:19095` | rgbd_ws_bridge address |
+| `--ws-url` | `ws://192.168.31.67:19095` | rgbd_ws_bridge address |
 | `--ws-frame-max-age-ms` | `250` | Drop frames older than this in `latest()` |
 | `--ws-reconnect-backoff-ms` | `500,1000,2000,5000,10000` | Reconnect backoff schedule (caps at last value) |
 | `--ws-startup-timeout-ms` | `30000` | Abort if no first frame within this timeout |
@@ -396,7 +411,7 @@ percentiles. Any of the following abort the launch with `exit(1)`:
 | `--num-inference-steps` | `None` (auto) | Diffusion steps. `None` → `train_config.eval_num_inference_steps` (=10) |
 | `--chunk-max-stale-ms` | `2000` | Watchdog HOLD when newest chunk older than this |
 | `--auto-dispatch` | `False` | Send `arm.send_pose` only when set; otherwise dispatcher logs targets but does NOT command the arm |
-| `--emergency-on-failure` | `True` | Trip `set_arm_emergency_stop(True)` on hard fault |
+| `--emergency-on-failure` / `--no-emergency-on-failure` | `True` | Trip `set_arm_emergency_stop(True)` on hard fault. Pass `--no-emergency-on-failure` to disable (e.g. dry-run). |
 | `--watchdog-period-ms` | `10` | Watchdog tick period |
 | `--instruction` | `"open the door"` | Default task; `/start` may override via JSON body |
 | `--device` | `cuda:1` | GPU device. Default avoids `cuda:0` (reserved for AirDC capture) |
@@ -457,7 +472,7 @@ WS connect):
 INFO [startup] script               = fastwam_active_loop_server.py v2
 INFO [startup] train_config_path    = runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/config.yaml
 INFO [startup] device               = cuda:1
-INFO [startup] ws_url               = ws://192.168.31.66:19095
+INFO [startup] ws_url               = ws://192.168.31.67:19095
 INFO [startup] ws_channels          = head_left, right_wrist_left  (identity mapping)
 INFO [startup] arm_host:port        = 192.168.31.34:50051
 INFO [startup] arm_lease_ms         = 15000     (SDK auto-renew @ 5s)
@@ -501,7 +516,7 @@ re-launch the server. Confirm with:
 
 ```bash
 curl -sf -o /dev/null -w "%{http_code}\n" \
-  --connect-timeout 2 "http://192.168.31.66:19095" || echo "WS port closed"
+  --connect-timeout 2 "http://192.168.31.67:19095" || echo "WS port closed"
 # Or one-shot probe:
 python scripts/fastwam_ws_probe.py --max-packets 5
 ```
@@ -529,7 +544,7 @@ power / process, then re-launch.
 Process-wide proxy is intercepting LAN traffic. Set:
 
 ```bash
-export NO_PROXY=192.168.31.66,192.168.31.34,127.0.0.1,localhost
+export NO_PROXY=192.168.31.67,192.168.31.34,127.0.0.1,localhost
 ```
 
 The server already injects these into `os.environ` at boot, but matters for
@@ -549,12 +564,39 @@ resort, drop `--num-inference-steps` (default 10) to 6 — design doc §3
 shows mean drops to ~117 ms with quality margin still untested in the
 wild.
 
-### `lease_alive: false` after `POST /start`
+### `POST /start` returns 503 `arm.acquire_control failed`
 
-`acquire_control` failed silently. The likely cause is another process
-holding the lease (concurrent server, leftover record-and-replay session).
-`set_arm_emergency_stop(false)` does NOT free the lease — kill the other
-client. Verify with the airbot controller logs.
+Either another client holds the lease, or `switch_controller(servo_control)`
+failed inside `acquire_control` (PR8 path). Kill the other client first.
+After PR9 R9, `/start` refuses to launch the runner if any of
+`acquire_control` / `switch_controller` / `set_arm_speed` fail —
+previously it would silently proceed and every `send_pose` would return
+False until estop. `set_arm_emergency_stop(false)` does NOT free the
+lease — verify with the airbot controller logs.
+
+### `health().status == "RED"` but everything looks fine
+
+Three independent paths raise RED:
+
+1. `consecutive_fail >= 5` — poller can't read state (network drop or SDK busy).
+2. `consecutive_send_fail >= 5` — `send_pose` rejected 5+ times in a row (joint limit, SDK busy, lease lost). Look at SDK log; check `lease_renew_count` for auto-reacquire churn.
+3. `lease_alive == False` while `_acquired == True` — SDK silently dropped the lease (another client preempted). `send_pose` will auto-reacquire once (PR11 R15); if `lease_renew_count` keeps climbing you have a real preemptor.
+
+### `send_pose ValueError`: xyz / rpy / gripper out of range
+
+PR11 R14 sanity-checks every dispatched target before the SDK call:
+
+- `|xyz| <= 1.0 m` (workspace)
+- `|rpy| <= π + 0.01 rad` (Euler range with epsilon)
+- `gripper ∈ [0, 0.15] m` (covers G2 / G2T / G2L)
+- no NaN
+
+If model output exceeds these the dispatcher raises `ValueError` instead
+of letting it reach the SDK. Look at `runner.status()` →
+`dispatch.last_pose_target` to find the offending frame; check whether
+chunk integration (`_delta_to_absolute`) produced a drift over many
+chunks. The thresholds are intentionally conservative — relax in
+`arm_client.send_pose` only after a coordinate-frame audit.
 
 ### text-embed cache miss on `/start {"instruction": "..."}`
 

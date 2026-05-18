@@ -39,7 +39,7 @@ def _ensure_no_proxy(url: str) -> str | None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="fastwam WS probe (V4 encoded_sync_pair)")
-    p.add_argument("--url", default="ws://192.168.31.66:19095", help="websocket URL")
+    p.add_argument("--url", default="ws://192.168.31.67:19095", help="websocket URL")
     p.add_argument("--max-packets", type=int, default=8, help="stop after N packets")
     p.add_argument("--no-decode", action="store_true", help="skip H.264 decode")
     p.add_argument("--connect-timeout-s", type=float, default=10.0, help="overall wallclock budget")

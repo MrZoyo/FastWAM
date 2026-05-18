@@ -203,7 +203,7 @@ def test_argparser_v2_defaults_match_design():
     assert ns.port == 8118
     assert ns.device == "cuda:1"
     assert ns.require_gpu_mem_free_gb == 8.0
-    assert ns.ws_url == "ws://192.168.31.66:19095"
+    assert ns.ws_url == "ws://192.168.31.67:19095"
     assert ns.infer_period_ms == 400
     assert ns.send_period_ms == 50
     assert ns.blend_frames == 4

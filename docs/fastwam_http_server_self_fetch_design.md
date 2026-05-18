@@ -84,8 +84,8 @@ HTTP 接口：
 |             | - drop stale: ceil(age/50ms) |                    |
 |             | - blend 4 frames w=0.25..1.0 |                    |
 |             | - rpy_to_quat_xyzw           |                    |
-|             | - client.move_end_pose       |                    |
-|             | - client.move_eef            |                    |
+|             | - move_end_pose + eef_pos    |                    |
+|             |   (single RPC; opts.eef_pos) |                    |
 |             +--------------+---------------+                    |
 |                            |                                    |
 |                            v                                    |
@@ -100,7 +100,7 @@ HTTP 接口：
                              v
                  +---------------------------+
                  | External services         |
-                 | WS  192.168.31.66:19095   |
+                 | WS  192.168.31.67:19095   |
                  | ARM 192.168.31.34:50051   |
                  +---------------------------+
 ```
@@ -144,7 +144,7 @@ t=400     next inference triggered
 | `_preprocess_image` (stitch + resize + crop + normalize) | 待实测（v1 估 ~2.4 ms 是 480×640 → 224×448；1088×1280 → 224×448 会略慢） | **新增项** |
 | `FastWAMModelClient.infer` @ 10 steps | 167.5–192.5 ms (p50–p99) | **实测**（5090 GPU，n=30，含 _preprocess_image） |
 | chunk_cache → dispatcher 接管 | ≤ 50 ms | 设计目标 |
-| `move_end_pose` + `move_eef` RPC | < 1 ms | 实测同 ARM 三连发 |
+| `move_end_pose(pose, opts.eef_pos=g)` 单 RPC | < 1 ms | 实测同 ARM 三连发；PR8 合并 move_eef 入 options |
 | **总闭环（捕获 → 第一帧下发）** | **~225 ms** | 实测 |
 
 WS 帧到达 jitter（**实测**）：
@@ -255,7 +255,7 @@ end_pose.orientation : (~0, 0, 0, 1) xyzw   ← 起始接近无旋转
 | `--dataset-stats` | `runs/.../dataset_stats.json` | normalizer stats |
 | `--text-cache-dir` | `data/text_embeds_cache/real_1048` | text emb cache |
 | `--default-camera-info` | `configs/camera_info/real_1048_default.json` | 双路相机标定，复用旧 server |
-| `--ws-url` | `ws://192.168.31.66:19095` | rgbd_ws_bridge 地址 |
+| `--ws-url` | `ws://192.168.31.67:19095` | rgbd_ws_bridge 地址 |
 | `--ws-frame-max-age-ms` | `250` | frame_cache 单帧最大允许年龄（v1 200，v2 放宽以应对 ±35 ms recv jitter） |
 | `--ws-reconnect-backoff-ms` | `500,1000,2000,5000,10000` | 断线重连退避（逗号分隔，封顶最后一个值） |
 | `--ws-startup-timeout-ms` | `30000` | 启动时等首帧的最大时间，超时 abort |
@@ -400,10 +400,17 @@ class ArmClient:
 
 行为细节：
 
-- **lease**：完全信任 `AirbotClient.acquire_control(lease_ms=15000, renew_period_s=5.0)` 的内置续期线程，**不外加 timer**。`health()` 读 SDK 内部 `_lease_id` / `_lease_expire_unix_ms` 暴露状态。
+- **lease**：完全信任 `AirbotClient.acquire_control(lease_ms=15000, renew_period_s=5.0)` 的内置续期线程，**不外加 timer**。`health()` 读 SDK 内部 `_lease_id` / `_lease_expire_unix_ms` 暴露状态。**PR8** 后 `acquire_control` 在 SDK lease 拿到后再追加 `switch_controller(Controller.servo_control)` + `set_arm_speed([0.5]*6)`，任意一段失败都回滚 lease。
 - 后台 poller 串行三个 RPC（实测 ~1 ms），写 `state_cache`。失败计数 `_consecutive_fail`，连续 5 次 → `health()` 标 RED。
-- 每次写入 cache 前对 `eef_quat_xyzw` 做 `unwrap_quat_sign(new, last_quat)`，避免 ±q 翻号。
-- `send_pose`：`rpy → rpy_to_quat_xyzw → CartesianPose(position=(x,y,z), orientation=(qx,qy,qz,qw))` → `client.move_end_pose(pose, options=ArmControlOptions(), timeout_ms=1000)`；gripper 单独 `client.move_eef(g, options=ArmControlOptions(), timeout_ms=1000)`。`ArmControlOptions()` 默认 `blocking=False`。任一返回 False → 抛 `ArmSdkError`。
+- 每次写入 cache 前对 `eef_quat_xyzw` 做 `unwrap_quat_sign(new, last_quat)` + 对 rpy 做 `unwrap_rpy_sequence` 双层兜底（**PR11 R7**），避免 ±π 翻号导致 cumsum 爆飞。
+- `send_pose`（**PR8 单次 RPC**，**PR11 加 sanity + reacquire**）：
+  1. **Sanity check**：`|xyz|≤1m / |rpy|≤π+0.01 / gripper∈[0, 0.15]` / no NaN，越界抛 `ValueError`（区别于 SDK 失败的 `ArmSdkError`）；
+  2. `rpy → rpy_to_quat_xyzw → CartesianPose(position=(x,y,z), orientation=(qx,qy,qz,qw))`；
+  3. `opts = ArmControlOptions()`（默认 `blocking=False`）；若 gripper_m 给定，`opts.eef_pos = gripper_m`；
+  4. **一次 RPC**：`client.move_end_pose(pose, opts)`（**不再分两次调 move_eef** — SDK PDF p.31 警告 servo_control + non-blocking 下双调用会中断 move_end_pose）；
+  5. RPC 返回 False **且** `_lease_id` 被 SDK 清空 **且** `_acquired=True` → 自动 `acquire_control()` 重试一次 + 再发一次 RPC（`lease_renew_count++`）；
+  6. 最终失败 → `consecutive_send_fail++` + 抛 `ArmSdkError`，成功 → `consecutive_send_fail = 0`。
+- `health()` 字段（**PR11 R6 完整化**）：`status: GREEN/YELLOW/RED` + `consecutive_fail` + `consecutive_send_fail` + `last_poll_age_ms` + `lease_alive` + `lease_renew_count` + `last_quat_unwrap_count` + `running`。`worst = max(consecutive_fail, consecutive_send_fail)`，`>=5 RED / >=3 YELLOW / else GREEN`；lease 丢失（`lease_alive==False && _acquired==True`）硬 RED。
 - `emergency_stop` 阻塞 0.15 s（SDK 已知行为）。
 
 ⚠️ **arm_sdk `set_arm_speed(arm_speed: list[float])` 只接受 6 个关节速度，没有独立 EEF 线速度 API**。v1 设计稿的 `set_speeds(arm_rad_s, eef_m_s)` 改为：
@@ -597,7 +604,7 @@ HTTP endpoints（仅这些，无 `/infer`）：
 [startup] num_inference_steps  = 10        (from eval_num_inference_steps)
 [startup] device               = cuda:1
 [startup] gpu_free_mem_gb      = NN.N      (require ≥ 8)
-[startup] ws_url               = ws://192.168.31.66:19095
+[startup] ws_url               = ws://192.168.31.67:19095
 [startup] ws_channels          = head_left, right_wrist_left  (identity mapping)
 [startup] arm_host:port        = 192.168.31.34:50051
 [startup] arm_lease_ms         = 15000     (SDK auto-renew @ 5s)
@@ -741,10 +748,10 @@ websocket-client >= 1.9.0
 - **影响**：中。
 - **回滚**：`--blend-frames=0`。
 
-### 风险 7 — lease 续期失败（v2 简化）
+### 风险 7 — lease 续期失败（v2 简化 + PR11 R15 自动 reacquire）
 - **现象**：arm_sdk lease 默认 15 s，SDK 自带后台续期；若 SDK 自身故障 / 网络断 → 续期失败。
 - **影响**：高。
-- **缓解**：(a) **完全信任 SDK 内置续期**，不外加 timer；(b) `arm.health()` 每 100 ms 检查 SDK 内部 `_lease_id` 是否为 None，None > 200 ms → emergency_stop；(c) RPC 返回 "control lease cleared" 类错误立刻急停。
+- **缓解**：(a) **完全信任 SDK 内置续期**，不外加 timer；(b) **PR11 R15**：`send_pose` RPC 返回 False **且** SDK `_lease_id` 已清 **且** ArmClient 仍 `_acquired=True` 时，自动 `acquire_control` 重试一次（含 `switch_controller(servo_control)` + `set_arm_speed`），`lease_renew_count++`；再失败才 `consecutive_send_fail++` + 抛 `ArmSdkError`；(c) `arm.health()` 暴露 `lease_alive` / `lease_renew_count` 供 watchdog 决策。
 - **回滚**：手动急停 + 重启 server。
 
 ### 风险 8 — 模型推理时延（已实测，仍需运行期监控）
