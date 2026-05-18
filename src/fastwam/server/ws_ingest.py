@@ -30,6 +30,20 @@ EXPECTED_TYPE = "encoded_sync_pair"
 WARMUP_MAX_EMPTY_PACKETS = 2  # PyAV may emit empty frames for first ~2 packets
 
 
+class _WarmupFailure(RuntimeError):
+    """Raised internally when PyAV warmup exceeds the empty-packet budget.
+
+    Caught by :meth:`WSFrameIngester._on_message` to reset the offending
+    channel's decoder instead of propagating the exception to the
+    websocket-client callback (which would kill the ingester thread and
+    prevent future reconnects).
+    """
+
+    def __init__(self, channel: str, message: str) -> None:
+        super().__init__(message)
+        self.channel = channel
+
+
 class FrameSnapshot(NamedTuple):
     bgr: np.ndarray  # (H, W, 3) uint8
     capture_ts_ns: int  # channel.meta['stamp_ns']
@@ -129,6 +143,7 @@ class WSFrameIngester:
         self._pair_seq_gaps = 0
         self._last_pair_seq: int | None = None
         self._startup_validated = False
+        self._decoder_reset_count = 0
 
     # -- lifecycle ------------------------------------------------------
 
@@ -195,6 +210,7 @@ class WSFrameIngester:
             "decode_fail_count": self._decode_fail_count,
             "reconnect_count": self._reconnect_count,
             "pair_seq_gaps": self._pair_seq_gaps,
+            "decoder_reset_count": self._decoder_reset_count,
         }
 
     # -- internals ------------------------------------------------------
@@ -284,7 +300,15 @@ class WSFrameIngester:
             if not name:
                 continue
             stamp_ns = int(ch_meta.get("stamp_ns", 0))
-            self._decode_channel(name, raw, stamp_ns, pair_seq)
+            try:
+                self._decode_channel(name, raw, stamp_ns, pair_seq)
+            except _WarmupFailure as exc:
+                # PyAV warmup budget exhausted for this channel. Reset its
+                # decoder so future packets get a fresh shot. Do NOT re-raise:
+                # propagating would trip websocket-client's on_error path,
+                # close the socket and kill the run_forever loop — preventing
+                # any further reconnect (see PR13).
+                self._reset_channel_decoder(exc.channel, reason=str(exc))
 
         # signal startup once any decoder produced a frame
         if not self._startup_event.is_set():
@@ -292,6 +316,24 @@ class WSFrameIngester:
                 got_any = bool(self._latest)
             if got_any:
                 self._startup_event.set()
+
+    def _reset_channel_decoder(self, name: str, *, reason: str) -> None:
+        """Drop a broken decoder + warmup counter so the channel can recover.
+
+        Called from :meth:`_on_message` when :meth:`_decode_channel` raises
+        :class:`_WarmupFailure`. Increments ``_decoder_reset_count`` (visible
+        via :meth:`health`) so operators can observe how often warmup
+        auto-recovery has kicked in.
+        """
+        self._decoder_reset_count += 1
+        self._decoders.pop(name, None)
+        self._empty_packet_count[name] = 0
+        self._logger.warning(
+            "resetting decoder name=%s reason=%s decoder_reset_count=%d",
+            name,
+            reason,
+            self._decoder_reset_count,
+        )
 
     def _decode_channel(self, name: str, raw: bytes, stamp_ns: int, pair_seq: int) -> None:
         decoder = self._decoders.get(name)
@@ -312,10 +354,11 @@ class WSFrameIngester:
             self._empty_packet_count[name] = self._empty_packet_count.get(name, 0) + 1
             if self._empty_packet_count[name] > WARMUP_MAX_EMPTY_PACKETS:
                 self._decode_fail_count += 1
-                raise RuntimeError(
+                raise _WarmupFailure(
+                    name,
                     f"PyAV warmup failed: channel={name} produced "
                     f"{self._empty_packet_count[name]} empty packets in a row "
-                    f"(expected first frame by packet 3)"
+                    f"(expected first frame by packet 3)",
                 )
             return
 

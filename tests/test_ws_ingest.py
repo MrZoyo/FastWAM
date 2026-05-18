@@ -171,6 +171,83 @@ def test_health_starts_empty():
     assert h["decode_fail_count"] == 0
     assert h["reconnect_count"] == 0
     assert h["pair_seq_gaps"] == 0
+    assert h["decoder_reset_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# PR13: warmup failure must NOT kill the WS thread.
+# ---------------------------------------------------------------------------
+
+
+class _FakeWS:
+    """Stand-in for the websocket-client WebSocketApp passed into _on_message.
+
+    _on_message only touches it via ``ws.close()`` on startup-validation
+    failure, which we never trigger here.
+    """
+
+    def __init__(self) -> None:
+        self.close_called = False
+
+    def close(self) -> None:  # pragma: no cover - not exercised
+        self.close_called = True
+
+
+def test_decode_channel_recovers_from_warmup_failure(build_v4_packet, ws_packet_bytes):
+    """A burst of un-decodable packets must trigger _WarmupFailure inside
+    _decode_channel; _on_message must swallow it, reset the decoder, and
+    let subsequent real packets decode normally."""
+    ing = _make_ingester()
+    fake_ws = _FakeWS()
+
+    # 3 garbage packets — all-zero payloads → PyAV emits no frames → warmup
+    # budget (2) exhausted on the 3rd, raising _WarmupFailure for BOTH channels.
+    garbage = b"\x00" * 32
+    for i in range(3):
+        pkt = build_v4_packet(payload_a=garbage, payload_b=garbage, pair_seq=i)
+        # Must NOT raise — that is the whole point of PR13.
+        ing._on_message(fake_ws, pkt)
+
+    # Warmup tripped on the 3rd packet for each of the 2 channels (head_left,
+    # right_wrist_left), so we expect ≥1 fail and ≥1 reset per channel.
+    h = ing.health()
+    assert h["decode_fail_count"] >= 1, h
+    assert h["decoder_reset_count"] >= 1, h
+    # ws.close() must not have been triggered — only startup validation closes.
+    assert fake_ws.close_called is False
+
+    # Now feed valid H.264 packets — fresh decoders should warm up and emit
+    # a frame for head_left within a couple of packets.
+    for pkt in ws_packet_bytes:
+        ing._on_message(fake_ws, pkt)
+
+    snap = ing.latest("head_left")
+    assert snap is not None, "expected a real frame after decoder reset + recovery"
+    assert snap.bgr.ndim == 3 and snap.bgr.shape[2] == 3
+    assert snap.bgr.dtype.name == "uint8"
+
+
+def test_health_reports_decoder_reset_count(build_v4_packet):
+    """health() must expose decoder_reset_count and update it after a warmup
+    auto-recovery."""
+    ing = _make_ingester()
+    fake_ws = _FakeWS()
+
+    # Sanity: brand-new ingester reports zero.
+    assert ing.health()["decoder_reset_count"] == 0
+
+    garbage = b"\x00" * 32
+    for i in range(3):
+        ing._on_message(fake_ws, build_v4_packet(
+            payload_a=garbage, payload_b=garbage, pair_seq=i,
+        ))
+
+    h = ing.health()
+    assert "decoder_reset_count" in h
+    assert isinstance(h["decoder_reset_count"], int)
+    # 3rd garbage packet trips both channels' warmup budget → 2 resets total.
+    assert h["decoder_reset_count"] >= 1
+    assert h["decoder_reset_count"] == ing._decoder_reset_count
 
 
 def test_latest_returns_none_for_stale_frame(ws_packet_bytes):
