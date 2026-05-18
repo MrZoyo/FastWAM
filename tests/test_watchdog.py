@@ -259,3 +259,96 @@ class TestStatus:
         wd._tick()
         assert wd.status()["infer_heartbeat_age_ms"] is not None
         assert wd.status()["infer_heartbeat_age_ms"] < 100.0
+
+
+# ---------------------------------------------------------------------------
+# PR12: start() must reset state; hold must auto-clear on fresh chunk
+# ---------------------------------------------------------------------------
+class TestStartResetAndHoldRelease:
+    def test_watchdog_start_resets_chunk_tracking_state(self):
+        ring = FakeRing(latest=None)
+        arm, ws, disp = make_arm(), make_ws(), MagicMock()
+        wd = make_wd(ring, arm, ws, disp)
+        # Pre-populate with ancient state from a previous /start cycle
+        ancient = time.monotonic_ns() - 9 * 60 * 1_000_000_000  # 9 minutes ago
+        wd._last_seen_chunk_id = 42
+        wd._last_seen_chunk_base_ns = 1
+        wd._last_chunk_seen_mono_ns = ancient
+        wd._arm_red_start_mono_ns = ancient
+        wd._infer_heartbeat_ns = ancient
+        with wd._state_lock:
+            wd._metrics.hold_reason = "chunk_missing"
+            wd._metrics.chunk_stale_count = 5
+            wd._metrics.tick_count = 1234
+
+        wd.start()
+        try:
+            assert wd._last_seen_chunk_id is None
+            assert wd._last_seen_chunk_base_ns is None
+            assert wd._last_chunk_seen_mono_ns is None
+            assert wd._arm_red_start_mono_ns is None
+            assert wd._infer_heartbeat_ns is None
+            st = wd.status()
+            assert st["hold_reason"] == ""
+            assert st["chunk_stale_count"] == 0
+        finally:
+            wd.stop()
+
+    def test_watchdog_no_chunk_missing_on_fresh_start(self):
+        """Reproduces the bug: 2nd /start with stale internal state + empty ring."""
+        ring = FakeRing(latest=None)
+        arm, ws, disp = make_arm(), make_ws(), MagicMock()
+        wd = make_wd(ring, arm, ws, disp, chunk_max_stale_ms=2000)
+        # Simulate prior cycle's lingering state (would normally trigger chunk_missing)
+        wd._last_chunk_seen_mono_ns = time.monotonic_ns() - 9 * 60 * 1_000_000_000
+
+        wd.start()
+        try:
+            wd._tick()  # exercise the same code path the loop runs
+            chunk_missing_calls = [
+                c for c in disp.set_hold.call_args_list
+                if c.args and c.args[0] is True
+                and "chunk_missing" in (c.kwargs.get("reason", "") or (c.args[1] if len(c.args) > 1 else ""))
+            ]
+            assert not chunk_missing_calls, (
+                f"unexpected chunk_missing hold on fresh /start: {disp.set_hold.call_args_list}"
+            )
+        finally:
+            wd.stop()
+
+    def test_watchdog_clears_hold_when_new_chunk_arrives(self):
+        ring = FakeRing(latest=None)
+        arm, ws, disp = make_arm(), make_ws(), MagicMock()
+        wd = make_wd(ring, arm, ws, disp, chunk_max_stale_ms=100)
+        # Pretend we are already held due to chunk_missing
+        with wd._state_lock:
+            wd._metrics.hold_reason = "chunk_missing"
+        # Now a brand-new chunk arrives
+        ring.set(make_chunk(chunk_id=7, base_ns=time.time_ns()))
+        wd._tick()
+        release_calls = [
+            c for c in disp.set_hold.call_args_list
+            if c.args and c.args[0] is False
+        ]
+        assert release_calls, (
+            f"expected dispatcher.set_hold(False) call; got {disp.set_hold.call_args_list}"
+        )
+        assert wd.status()["hold_reason"] == ""
+
+    def test_watchdog_keeps_hold_on_unrelated_reason(self):
+        ring = FakeRing(latest=None)
+        arm, ws, disp = make_arm(), make_ws(), MagicMock()
+        wd = make_wd(ring, arm, ws, disp, chunk_max_stale_ms=100)
+        with wd._state_lock:
+            wd._metrics.hold_reason = "ws_stale:600ms"
+        ring.set(make_chunk(chunk_id=9, base_ns=time.time_ns()))
+        wd._tick()
+        # chunk-related auto-clear must NOT touch ws_stale hold
+        release_calls = [
+            c for c in disp.set_hold.call_args_list
+            if c.args and c.args[0] is False
+        ]
+        assert not release_calls, (
+            f"set_hold(False) must not fire for non-chunk reasons; got {disp.set_hold.call_args_list}"
+        )
+        assert wd.status()["hold_reason"] == "ws_stale:600ms"

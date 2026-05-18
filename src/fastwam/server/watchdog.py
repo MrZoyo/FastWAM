@@ -84,6 +84,7 @@ class Watchdog:
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("Watchdog.start called twice")
+        self._reset_internal_state()
         self._stop_evt.clear()
         self._thread = threading.Thread(
             target=self._run, name="Watchdog", daemon=True
@@ -93,6 +94,16 @@ class Watchdog:
             "[watchdog] start period=%.0f ms infer_period=%d ms",
             self._period_s * 1000.0, self._infer_period_ns // _NS_PER_MS,
         )
+
+    def _reset_internal_state(self) -> None:
+        """Wipe chunk / RPC / arm tracking so a re-/start does not see stale gaps."""
+        self._last_seen_chunk_id = None
+        self._last_seen_chunk_base_ns = None
+        self._last_chunk_seen_mono_ns = None
+        self._arm_red_start_mono_ns = None
+        self._infer_heartbeat_ns = None
+        with self._state_lock:
+            self._metrics = _WatchdogMetrics()
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -173,6 +184,8 @@ class Watchdog:
             self._last_seen_chunk_id = chunk.chunk_id
             self._last_seen_chunk_base_ns = chunk.base_capture_ts_ns
             self._last_chunk_seen_mono_ns = now_mono_ns
+            # fresh chunk → release any chunk-related hold we previously set
+            self._maybe_clear_hold(("chunk_missing", "chunk_stale"))
 
         chunk_len = int(chunk.action_abs.shape[0])
         chunk_end_ns = chunk.base_capture_ts_ns + chunk_len * chunk.step_dt_ns
@@ -277,6 +290,19 @@ class Watchdog:
             )
 
     # ---------------------------------------------------------------- actions
+    def _maybe_clear_hold(self, reason_prefixes: tuple) -> None:
+        """Release dispatcher hold iff current hold_reason matches one of the prefixes."""
+        with self._state_lock:
+            current = self._metrics.hold_reason
+        if not current or not any(current.startswith(p) for p in reason_prefixes):
+            return
+        try:
+            self._dispatcher.set_hold(False, reason="")
+        except Exception:  # pragma: no cover
+            self._logger.exception("[watchdog] dispatcher.set_hold(False) raised")
+        with self._state_lock:
+            self._metrics.hold_reason = ""
+
     def _notify_hold(self, reason: str) -> None:
         with self._state_lock:
             self._metrics.hold_reason = reason
