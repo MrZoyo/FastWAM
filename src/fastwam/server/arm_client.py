@@ -17,7 +17,7 @@ from typing import Any, NamedTuple, Optional
 
 import numpy as np
 
-from ._rotation_local import (
+from .rotation import (
     quat_xyzw_to_rpy,
     rpy_to_quat_xyzw,
     unwrap_quat_sign,
