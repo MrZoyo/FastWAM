@@ -10,6 +10,20 @@ issues a single ``move_end_pose`` per tick with the gripper target carried in
 ``ArmControlOptions.eef_pos`` — calling ``move_eef`` separately would interrupt
 the previous pose command (SDK PDF p.31 / guide §4.1).
 
+PR11 scope (server-side ARM hardening, guide §7 + §2 + §4.2):
+  - R6: ``health()`` exposes a GREEN/YELLOW/RED ``status`` derived from both
+    poller and send-pose consecutive failures, plus a hard RED on lease loss
+    (lease_alive==False while we still believe we are the owner).
+  - R7: poller post-processes rpy via ``unwrap_rpy_sequence`` against the
+    previous frame to eliminate ±π → ∓π jumps from ``Rotation.as_euler``.
+  - R14: ``send_pose`` performs sanity-checks (workspace, rpy range, gripper
+    range) before issuing the RPC; bad inputs raise ``ValueError`` (input
+    validation), distinct from ``ArmSdkError`` (SDK-side failure).
+  - R15: ``send_pose`` makes ONE auto-reacquire attempt when ``move_end_pose``
+    returns False AND the SDK has cleared ``_lease_id`` (lease kicked); the
+    re-RPC follows the reacquire. ``lease_renew_count`` in ``health()`` tracks
+    these reacquires.
+
 The lease is fully delegated to ``AirbotClient.acquire_control`` — its built-in
 ``_lease_thread`` auto-renews on the SDK side, so we never start our own
 timer (design doc risk #7).
@@ -27,6 +41,7 @@ from .rotation import (
     quat_xyzw_to_rpy,
     rpy_to_quat_xyzw,
     unwrap_quat_sign,
+    unwrap_rpy_sequence,
 )
 
 
@@ -110,6 +125,12 @@ class ArmClient:
         self._last_quat: Optional[np.ndarray] = None
         self._last_quat_unwrap_count = 0
         self._acquired = False
+        # PR11 R6: track consecutive send_pose failures for status tri-level.
+        self._consecutive_send_fail = 0
+        # PR11 R7: previous rpy sample for unwrap_rpy_sequence().
+        self._last_rpy: Optional[np.ndarray] = None
+        # PR11 R15: count auto-reacquires triggered by send_pose lease-loss path.
+        self._lease_renew_count = 0
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -241,11 +262,17 @@ class ArmClient:
         return snap
 
     def health(self) -> dict:
+        # PR11 R6: ``status`` is GREEN/YELLOW/RED from the worst of
+        # consecutive_fail (poll) and consecutive_send_fail (move_end_pose):
+        # 0-2 GREEN, 3-4 YELLOW, >=5 RED. Lease loss while ``_acquired``
+        # forces RED regardless of the counters.
         now_ns = time.time_ns()
         with self._state_lock:
             last_poll = self._last_poll_ts_ns
             fail = self._consecutive_fail
             unwrap = self._last_quat_unwrap_count
+            send_fail = self._consecutive_send_fail
+            lease_renew_count = self._lease_renew_count
         if last_poll == 0:
             last_age_ms: Optional[float] = None
         else:
@@ -258,12 +285,27 @@ class ArmClient:
             )
         except Exception:  # pragma: no cover
             lease_alive = False
+
+        worst = max(fail, send_fail)
+        if worst >= 5:
+            status = "RED"
+        elif worst >= 3:
+            status = "YELLOW"
+        else:
+            status = "GREEN"
+        # PR11 R6: lease-loss while still believing we own it is hard RED.
+        if (not lease_alive) and self._acquired:
+            status = "RED"
+
         return {
             "last_poll_age_ms": last_age_ms,
             "consecutive_fail": fail,
+            "consecutive_send_fail": send_fail,
             "lease_alive": lease_alive,
+            "lease_renew_count": lease_renew_count,
             "last_quat_unwrap_count": unwrap,
             "running": self._thread is not None and self._thread.is_alive(),
+            "status": status,
         }
 
     # ------------------------------------------------------------------
@@ -275,11 +317,26 @@ class ArmClient:
         target_rpy: np.ndarray,
         gripper_m: Optional[float],
     ) -> bool:
+        # PR11 order: sanity-check (R14, ValueError) -> build pose ->
+        # move_end_pose -> on False+lease cleared: ONE reacquire + re-RPC (R15)
+        # -> on still False: bump consecutive_send_fail (R6) + raise ArmSdkError.
         if self._client is None:
             raise RuntimeError("ArmClient.send_pose before start()")
 
         xyz = np.asarray(target_xyz, dtype=np.float64).reshape(3)
         rpy = np.asarray(target_rpy, dtype=np.float64).reshape(3)
+
+        # PR11 R14: sanity check (guide §4.2). |xyz|<=1 m (Airbot reach <0.7m),
+        # rpy in (-π, π] with ε tolerance, gripper 0..0.15 m (G2/G2T/G2L).
+        if not np.all(np.isfinite(xyz)) or not np.all(np.abs(xyz) <= 1.0):
+            raise ValueError(f"target_xyz out of workspace |xyz|<=1m, got {xyz.tolist()}")
+        if not np.all(np.isfinite(rpy)) or not np.all(np.abs(rpy) <= np.pi + 0.01):
+            raise ValueError(f"target_rpy out of (-π, π], got {rpy.tolist()}")
+        if gripper_m is not None and (
+            not np.isfinite(gripper_m) or not (0.0 <= float(gripper_m) <= 0.15)
+        ):
+            raise ValueError(f"gripper_m out of [0, 0.15] m, got {gripper_m}")
+
         quat = rpy_to_quat_xyzw(rpy)
 
         if self._cart_pose_cls is None or self._opts_cls is None:
@@ -300,9 +357,48 @@ class ArmClient:
         # previous move_end_pose (SDK PDF p.31 / guide §4.1).
         if gripper_m is not None:
             opts.eef_pos = float(gripper_m)
-        ok = bool(self._client.move_end_pose(pose, opts))
+
+        try:
+            ok = bool(self._client.move_end_pose(pose, opts))
+        except Exception:
+            with self._state_lock:
+                self._consecutive_send_fail += 1
+            raise
+
         if not ok:
-            raise ArmSdkError("move_end_pose returned False")
+            # PR11 R15: lease may have been kicked by another client. The SDK
+            # clears _lease_id when its lease thread sees the server take it
+            # away. If we still believe we hold it, try ONE reacquire.
+            lease_cleared = (
+                hasattr(self._client, "_lease_id")
+                and self._client._lease_id is None
+                and self._acquired
+            )
+            if lease_cleared:
+                self._logger.warning(
+                    "[arm] move_end_pose failed and lease cleared; "
+                    "attempting one reacquire"
+                )
+                # acquire_control() re-runs switch_controller + set_arm_speed.
+                if self.acquire_control():
+                    with self._state_lock:
+                        self._lease_renew_count += 1
+                    try:
+                        ok = bool(self._client.move_end_pose(pose, opts))
+                    except Exception:
+                        with self._state_lock:
+                            self._consecutive_send_fail += 1
+                        raise
+
+        if not ok:
+            with self._state_lock:
+                self._consecutive_send_fail += 1
+            raise ArmSdkError(
+                "move_end_pose returned False (after reacquire if attempted)"
+            )
+
+        with self._state_lock:
+            self._consecutive_send_fail = 0
         return True
 
     # ------------------------------------------------------------------
@@ -345,6 +441,19 @@ class ArmClient:
                 unwrap_inc = 1
         self._last_quat = quat.astype(np.float64)
         rpy = quat_xyzw_to_rpy(quat)
+
+        # PR11 R7: even with sign-unwrapped quaternion, ``as_euler("xyz")`` can
+        # still produce ±π discontinuities (e.g. roll near π flips to -π on
+        # the next sample). Unwrap rpy against the previous frame so that the
+        # snapshot stream stays continuous for downstream consumers.
+        if self._last_rpy is not None:
+            seq = np.stack([
+                self._last_rpy.astype(np.float64),
+                rpy.astype(np.float64),
+            ])
+            seq = unwrap_rpy_sequence(seq)
+            rpy = seq[-1].astype(np.float32)
+        self._last_rpy = rpy.copy()
 
         snap = ArmStateSnapshot(
             angles_rad=angles,

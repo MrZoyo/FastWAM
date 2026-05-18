@@ -403,3 +403,295 @@ def test_acquire_control_acquire_returns_false_skips_switch():
         assert arm._acquired is False
     finally:
         arm.stop()
+
+
+# ---------------------------------------------------------------------------
+# PR11 R6: health().status tri-level + consecutive_send_fail
+# ---------------------------------------------------------------------------
+def test_health_status_green_baseline():
+    mock_sdk = _make_mock_sdk_client()
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        # wait for poller to populate one good sample
+        assert _wait_until(lambda: arm.latest() is not None, timeout_s=1.0)
+        h = arm.health()
+        assert h["status"] == "GREEN", h
+        assert h["consecutive_send_fail"] == 0
+        assert h["lease_renew_count"] == 0
+        assert h["consecutive_fail"] == 0
+    finally:
+        arm.stop()
+
+
+def test_health_status_yellow_at_3_send_fails():
+    mock_sdk = _make_mock_sdk_client()
+    mock_sdk.move_end_pose.return_value = False
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        for _ in range(3):
+            with pytest.raises(ArmSdkError):
+                arm.send_pose(np.zeros(3), np.zeros(3), gripper_m=0.05)
+        h = arm.health()
+        assert h["consecutive_send_fail"] == 3, h
+        assert h["status"] == "YELLOW", h
+    finally:
+        arm.stop()
+
+
+def test_health_status_red_at_5_send_fails():
+    mock_sdk = _make_mock_sdk_client()
+    mock_sdk.move_end_pose.return_value = False
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        for _ in range(5):
+            with pytest.raises(ArmSdkError):
+                arm.send_pose(np.zeros(3), np.zeros(3), gripper_m=0.05)
+        h = arm.health()
+        assert h["consecutive_send_fail"] == 5, h
+        assert h["status"] == "RED", h
+    finally:
+        arm.stop()
+
+
+def test_health_status_recovers_to_green_after_success():
+    # First 4 calls fail, 5th succeeds -> counter resets, status back to GREEN.
+    mock_sdk = _make_mock_sdk_client()
+    fail_then_pass = [False, False, False, False, True]
+    mock_sdk.move_end_pose.side_effect = lambda *a, **kw: fail_then_pass.pop(0)
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        for _ in range(4):
+            with pytest.raises(ArmSdkError):
+                arm.send_pose(np.zeros(3), np.zeros(3), gripper_m=0.05)
+        # success on 5th
+        assert arm.send_pose(np.zeros(3), np.zeros(3), gripper_m=0.05) is True
+        # wait for poller to also be in good state
+        assert _wait_until(lambda: arm.latest() is not None, timeout_s=1.0)
+        h = arm.health()
+        assert h["consecutive_send_fail"] == 0, h
+        assert h["status"] == "GREEN", h
+    finally:
+        arm.stop()
+
+
+def test_health_status_red_on_lease_lost():
+    mock_sdk = _make_mock_sdk_client()
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        # Force "we believe we own a lease but SDK has cleared it".
+        arm._acquired = True
+        mock_sdk._lease_id = None
+        h = arm.health()
+        assert h["lease_alive"] is False, h
+        assert h["status"] == "RED", h
+    finally:
+        arm.stop()
+
+
+# ---------------------------------------------------------------------------
+# PR11 R7: poller unwraps rpy across ±π
+# ---------------------------------------------------------------------------
+class _RpyEdgeSdk:
+    """Mock SDK that emits a fixed quaternion sequence (xyzw)."""
+
+    def __init__(self, quat_sequence):
+        self._seq = list(quat_sequence)
+        self._idx = 0
+        self._lock = threading.Lock()
+        self._cart_pose_cls = _CartesianPoseStub
+        self._opts_cls = _OptionsStub
+        self._lease_id = None
+
+    def _advance(self):
+        with self._lock:
+            idx = min(self._idx, len(self._seq) - 1)
+            self._idx += 1
+        return self._seq[idx]
+
+    def get_arm_joint_state(self):
+        return SimpleNamespace(angles=(0.0,) * 6)
+
+    def get_eef_joint_state(self):
+        return SimpleNamespace(eef_pos=0.0887)
+
+    def get_end_pose(self):
+        q = self._advance()
+        return SimpleNamespace(position=(0.28, 0.0, 0.21), orientation=q)
+
+    def acquire_control(self, lease_ms=15000, renew_period_s=5.0):
+        return True
+
+    def release_control(self):
+        return None
+
+    def close(self):
+        return None
+
+
+def test_poller_unwraps_rpy_across_pi_boundary():
+    # Craft two rpy that as_euler will return as roll≈+3.1 then roll≈-3.1
+    # (i.e. crossing ±π). After unwrap, the second sample's roll should be
+    # close to +3.1 + (2π - 6.2) ≈ +3.1832, NOT -3.1.
+    rpy_a = np.array([3.1, 0.1, 0.2], dtype=np.float64)
+    rpy_b = np.array([-3.1, 0.1, 0.2], dtype=np.float64)  # represents roll near -π
+    q_a = R.from_euler("xyz", rpy_a).as_quat()
+    q_b = R.from_euler("xyz", rpy_b).as_quat()
+    # Repeat to keep poller alive after the sequence is consumed.
+    seq = [tuple(q_a), tuple(q_b)] + [tuple(q_b)] * 80
+
+    mock_sdk = _RpyEdgeSdk(seq)
+    arm = _make_client(mock_sdk, poll_hz=200.0)
+    arm._test_start()
+    try:
+        # Wait for at least both samples to be consumed.
+        assert _wait_until(lambda: mock_sdk._idx >= 2, timeout_s=2.0)
+        # Give the poller one more tick to land the second snapshot in cache.
+        time.sleep(0.05)
+        snap = arm.latest()
+        assert snap is not None
+        unwrapped_roll = float(snap.eef_rpy[0])
+        # Without unwrap this would be ~ -3.1 (diff > π from prev +3.1).
+        # With unwrap it lands near +3.1 + (2π - 6.2) ≈ +3.1832.
+        assert unwrapped_roll > 3.0, snap.eef_rpy
+        # And specifically the jump from previous frame must be < π.
+        diff = abs(unwrapped_roll - 3.1)
+        assert diff < np.pi, f"rpy not unwrapped (diff={diff})"
+    finally:
+        arm.stop()
+
+
+# ---------------------------------------------------------------------------
+# PR11 R14: send_pose sanity checks
+# ---------------------------------------------------------------------------
+def test_send_pose_rejects_unreachable_xyz():
+    mock_sdk = _make_mock_sdk_client()
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        with pytest.raises(ValueError, match="target_xyz"):
+            arm.send_pose(np.array([2.0, 0.0, 0.0]), np.zeros(3), gripper_m=0.05)
+        # No RPC must have been issued.
+        assert mock_sdk.move_end_pose.call_count == 0
+    finally:
+        arm.stop()
+
+
+def test_send_pose_rejects_out_of_range_rpy():
+    mock_sdk = _make_mock_sdk_client()
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        with pytest.raises(ValueError, match="target_rpy"):
+            arm.send_pose(np.zeros(3), np.array([4.0, 0.0, 0.0]), gripper_m=0.05)
+        assert mock_sdk.move_end_pose.call_count == 0
+    finally:
+        arm.stop()
+
+
+def test_send_pose_rejects_invalid_gripper():
+    mock_sdk = _make_mock_sdk_client()
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        with pytest.raises(ValueError, match="gripper_m"):
+            arm.send_pose(np.zeros(3), np.zeros(3), gripper_m=-0.01)
+        with pytest.raises(ValueError, match="gripper_m"):
+            arm.send_pose(np.zeros(3), np.zeros(3), gripper_m=0.2)
+        assert mock_sdk.move_end_pose.call_count == 0
+    finally:
+        arm.stop()
+
+
+def test_send_pose_accepts_boundary_values():
+    mock_sdk = _make_mock_sdk_client()
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        # xyz boundary 1.0 m, rpy boundary ±π, gripper 0.15 m.
+        assert arm.send_pose(
+            np.array([1.0, 1.0, 1.0]),
+            np.array([np.pi, np.pi, np.pi]),
+            gripper_m=0.15,
+        ) is True
+        # Lower-bound boundary for gripper.
+        assert arm.send_pose(
+            np.array([-1.0, -1.0, -1.0]),
+            np.array([-np.pi, -np.pi, -np.pi]),
+            gripper_m=0.0,
+        ) is True
+        # gripper=None is allowed (no eef_pos override).
+        assert arm.send_pose(
+            np.zeros(3), np.zeros(3), gripper_m=None
+        ) is True
+    finally:
+        arm.stop()
+
+
+# ---------------------------------------------------------------------------
+# PR11 R15: send_pose auto-reacquire on lease loss
+# ---------------------------------------------------------------------------
+def test_send_pose_reacquires_on_lease_loss():
+    mock_sdk = _make_mock_sdk_client()
+    # First call to move_end_pose returns False AND clears the lease id;
+    # second call (after reacquire) returns True.
+    call_order = {"n": 0}
+
+    def _move_side_effect(*args, **kwargs):
+        call_order["n"] += 1
+        if call_order["n"] == 1:
+            mock_sdk._lease_id = None  # simulate lease kicked
+            return False
+        mock_sdk._lease_id = "lease-renewed"
+        return True
+
+    mock_sdk.move_end_pose.side_effect = _move_side_effect
+    # acquire_control will be called by reacquire path -> return True + set lease id.
+    def _acquire_side_effect(*args, **kwargs):
+        mock_sdk._lease_id = "lease-renewed"
+        return True
+    mock_sdk.acquire_control.side_effect = _acquire_side_effect
+
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        # Simulate that we already own the lease (so reacquire path is eligible).
+        arm._acquired = True
+        mock_sdk._lease_id = "lease-original"
+
+        assert arm.send_pose(np.zeros(3), np.zeros(3), gripper_m=0.05) is True
+        # Two move_end_pose calls: first failed, second succeeded.
+        assert mock_sdk.move_end_pose.call_count == 2
+        # One reacquire happened.
+        h = arm.health()
+        assert h["lease_renew_count"] == 1, h
+        # Counter cleared by final success.
+        assert h["consecutive_send_fail"] == 0, h
+    finally:
+        arm.stop()
+
+
+def test_send_pose_no_reacquire_when_lease_alive():
+    mock_sdk = _make_mock_sdk_client()
+    mock_sdk.move_end_pose.return_value = False
+    mock_sdk._lease_id = "lease-still-alive"  # not cleared
+
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        arm._acquired = True
+        with pytest.raises(ArmSdkError):
+            arm.send_pose(np.zeros(3), np.zeros(3), gripper_m=0.05)
+        # Only ONE move_end_pose call (no retry because lease is alive).
+        assert mock_sdk.move_end_pose.call_count == 1
+        # acquire_control must NOT have been called by send_pose retry path.
+        mock_sdk.acquire_control.assert_not_called()
+        h = arm.health()
+        assert h["lease_renew_count"] == 0, h
+        assert h["consecutive_send_fail"] == 1, h
+    finally:
+        arm.stop()
