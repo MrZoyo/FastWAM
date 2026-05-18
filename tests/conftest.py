@@ -115,11 +115,12 @@ def _encode_h264_packets(num_frames: int = 5, width: int = 320, height: int = 24
 
 
 def _ensure_fixture() -> tuple[bytes, list[tuple[int, int]]]:
-    """Lazy fixture builder: synthesizes V4 packet stream if absent."""
-    if FIXTURE_PATH.exists() and FIXTURE_INDEX_PATH.exists():
-        blob = FIXTURE_PATH.read_bytes()
-        idx = json.loads(FIXTURE_INDEX_PATH.read_text())
-        return blob, [(int(e["offset"]), int(e["length"])) for e in idx]
+    """Force-regenerate V4 packet fixture every session.
+
+    libx264-encoded bytes are not safe to cache across processes: a previously
+    generated .bin can fail to decode in a fresh PyAV/h264 decoder context.
+    Regenerating per session is cheap (~5 frames, single-digit ms).
+    """
 
     FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
     h264_chunks = _encode_h264_packets(num_frames=5)

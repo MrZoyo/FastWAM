@@ -17,7 +17,9 @@ import yaml
 
 from .arm_client import ArmClient
 from .chunk_ringbuffer import ChunkEntry, ChunkRingBuffer
+from .dispatch import DispatchLoop
 from .image_pipeline import undistort_native
+from .watchdog import Watchdog
 from .ws_ingest import FrameSnapshot, WSFrameIngester
 
 
@@ -56,7 +58,8 @@ class NoOpWatchdog:
     """PR5 placeholder for the PR6 Watchdog."""
 
     def __init__(self, ringbuffer, arm_client, ws_ingester,
-                 runner_status_provider, watchdog_period_ms, **kwargs: Any) -> None:
+                 watchdog_period_ms=10, runner_status_provider=None,
+                 **kwargs: Any) -> None:
         self.ringbuffer = ringbuffer
         self.arm_client = arm_client
         self.ws_ingester = ws_ingester
@@ -99,6 +102,11 @@ class ClosedLoopRunner:
         emergency_on_failure: bool = True,
         watchdog_period_ms: int = 10,
         image_pipeline: str = "raw_native",
+        undistort: bool = True,
+        default_instruction: Optional[str] = None,
+        ws_warn_stale_ms: int = 200,
+        ws_hold_stale_ms: int = 500,
+        ws_estop_stale_ms: int = 1500,
         dispatcher_factory: Optional[Callable[..., Any]] = None,
         watchdog_factory: Optional[Callable[..., Any]] = None,
         logger: Optional[logging.Logger] = None,
@@ -130,6 +138,11 @@ class ClosedLoopRunner:
         self.emergency_on_failure = bool(emergency_on_failure)
         self.watchdog_period_ms = int(watchdog_period_ms)
         self.image_pipeline = str(image_pipeline)
+        self.undistort = bool(undistort)
+        self.default_instruction = default_instruction
+        self.ws_warn_stale_ms = int(ws_warn_stale_ms)
+        self.ws_hold_stale_ms = int(ws_hold_stale_ms)
+        self.ws_estop_stale_ms = int(ws_estop_stale_ms)
         self._logger = logger or logging.getLogger("fastwam.closed_loop")
 
         # Config-driven validation (design doc §7.6).
@@ -160,6 +173,17 @@ class ClosedLoopRunner:
         self.chunk_len = int(chunk_len)
         self.num_inference_steps = int(num_inference_steps)
 
+        # Defensive: server pipeline assumes 7-DoF proprio (6 joints + gripper).
+        # Triggered when CLI points at a config whose proprio dim != 7 (e.g. cup task).
+        # Use isinstance(int) so MagicMock-style attribute access in tests is tolerated.
+        client_proprio = getattr(model_client, "proprio_dim", None)
+        if isinstance(client_proprio, int) and client_proprio != 7:
+            raise RuntimeError(
+                f"model_client.proprio_dim={client_proprio} != 7; "
+                "active loop server expects [j0..j5, gripper_m]. "
+                "Check --config matches the 7-DoF real_1048 task."
+            )
+
         # Runtime state.
         self.ringbuffer = ChunkRingBuffer(capacity=2)
         self._chunk_id_counter = 0
@@ -172,19 +196,32 @@ class ClosedLoopRunner:
         self._consecutive_infer_fail = 0
         self._hold_mode = False  # PR6 watchdog flips this
 
-        # Injected dispatcher / watchdog (default NoOps).
+        # Injected dispatcher / watchdog. Default = NoOp (PR5 unit tests stay
+        # green). active_loop_server.py injects PR6's DispatchLoop / Watchdog
+        # via make_production_factories() below.
         df = dispatcher_factory or NoOpDispatch
         wf = watchdog_factory or NoOpWatchdog
+        # Pass auto_dispatch to dispatcher (PR6 needs it; NoOp absorbs via **kwargs).
         self._dispatch = df(
             ringbuffer=self.ringbuffer, arm_client=self.arm_client,
             send_period_ms=self.send_period_ms, blend_frames=self.blend_frames,
             chunk_max_stale_ms=self.chunk_max_stale_ms,
+            auto_dispatch=self.auto_dispatch,
             emergency_on_failure=self.emergency_on_failure, logger=self._logger,
         )
+        # Pass dispatcher to watchdog (PR6 real Watchdog requires it; NoOp
+        # absorbs via **kwargs). runner_status_provider stays NoOp-only and is
+        # not passed here.
         self._watchdog = wf(
             ringbuffer=self.ringbuffer, arm_client=self.arm_client,
-            ws_ingester=self.ws_ingester, runner_status_provider=self.status,
-            watchdog_period_ms=self.watchdog_period_ms, logger=self._logger,
+            ws_ingester=self.ws_ingester, dispatcher=self._dispatch,
+            watchdog_period_ms=self.watchdog_period_ms,
+            chunk_max_stale_ms=self.chunk_max_stale_ms,
+            infer_period_ms=self.infer_period_ms,
+            ws_warn_stale_ms=self.ws_warn_stale_ms,
+            ws_hold_stale_ms=self.ws_hold_stale_ms,
+            ws_estop_stale_ms=self.ws_estop_stale_ms,
+            logger=self._logger,
         )
 
     # ------------------------------------------------------------------
@@ -193,7 +230,7 @@ class ClosedLoopRunner:
     def start(self, instruction: Optional[str] = None) -> None:
         if self._infer_thread is not None:
             raise RuntimeError("ClosedLoopRunner.start called twice")
-        self._instruction = instruction
+        self._instruction = instruction if instruction is not None else self.default_instruction
         self._stop_evt.clear()
         self._consecutive_infer_fail = 0
         self._last_skip_reason = None
@@ -262,6 +299,31 @@ class ClosedLoopRunner:
             "dispatch": self._dispatch.status() if hasattr(self._dispatch, "status") else None,
             "watchdog": self._watchdog.status() if hasattr(self._watchdog, "status") else None,
         }
+
+    # ------------------------------------------------------------------
+    # debug hook for PR7 /debug/zero_pose_test (design doc §9)
+    # ------------------------------------------------------------------
+    def inject_chunk_for_debug(
+        self, action_abs: np.ndarray, base_capture_ts_ns: Optional[int] = None
+    ) -> ChunkEntry:
+        """Push a synthetic ChunkEntry directly into the ringbuffer, bypassing
+        the model. Used by /debug/zero_pose_test to verify the coordinate frame:
+        actions=repeat(current_pose, chunk_len) should leave the arm stationary.
+        """
+        action_abs = np.asarray(action_abs, dtype=np.float32)
+        if action_abs.ndim != 2 or action_abs.shape != (self.chunk_len, 7):
+            raise ValueError(
+                f"inject_chunk_for_debug expected shape=({self.chunk_len}, 7), got {action_abs.shape}"
+            )
+        self._chunk_id_counter += 1
+        entry = ChunkEntry(
+            action_abs=action_abs,
+            base_capture_ts_ns=int(base_capture_ts_ns) if base_capture_ts_ns is not None else time.time_ns(),
+            step_dt_ns=self.send_period_ms * 1_000_000,
+            chunk_id=self._chunk_id_counter,
+        )
+        self.ringbuffer.push(entry)
+        return entry
 
     # ------------------------------------------------------------------
     # InferLoop
@@ -376,6 +438,8 @@ class ClosedLoopRunner:
                           wrist_frame: FrameSnapshot) -> dict[str, np.ndarray]:
         raw = {self.stereo_pair["left"]: head_frame.bgr,
                self.stereo_pair["right"]: wrist_frame.bgr}
+        if not self.undistort:
+            return raw
         if self.image_pipeline == "raw_native":
             return undistort_native(raw, self.default_camera_info, self.stereo_pair, alpha=0.0)
         # lerobot_480x640: undistort, then resize to training resolution (v1 fallback).
@@ -394,4 +458,47 @@ class ClosedLoopRunner:
             return yaml.safe_load(f)
 
 
-__all__ = ["ClosedLoopRunner", "NoOpDispatch", "NoOpWatchdog"]
+def make_production_factories() -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """Return (dispatcher_factory, watchdog_factory) wired to PR6 real classes.
+
+    active_loop_server.py passes the result into ClosedLoopRunner kwargs to
+    swap in production DispatchLoop / Watchdog (NoOps are the default for
+    unit tests).
+    """
+
+    def dispatcher_factory(**kw: Any) -> DispatchLoop:
+        return DispatchLoop(
+            ringbuffer=kw["ringbuffer"],
+            arm_client=kw["arm_client"],
+            send_period_ms=kw["send_period_ms"],
+            blend_frames=kw["blend_frames"],
+            chunk_max_stale_ms=kw["chunk_max_stale_ms"],
+            auto_dispatch=kw.get("auto_dispatch", False),
+            emergency_on_failure=kw.get("emergency_on_failure", True),
+            logger=kw.get("logger"),
+        )
+
+    def watchdog_factory(**kw: Any) -> Watchdog:
+        return Watchdog(
+            ringbuffer=kw["ringbuffer"],
+            arm_client=kw["arm_client"],
+            ws_ingester=kw["ws_ingester"],
+            dispatcher=kw["dispatcher"],
+            watchdog_period_ms=kw["watchdog_period_ms"],
+            chunk_max_stale_ms=kw.get("chunk_max_stale_ms", 2000),
+            infer_period_ms=kw.get("infer_period_ms", 400),
+            ws_warn_stale_ms=kw.get("ws_warn_stale_ms", 200),
+            ws_hold_stale_ms=kw.get("ws_hold_stale_ms", 500),
+            ws_estop_stale_ms=kw.get("ws_estop_stale_ms", 1500),
+            logger=kw.get("logger"),
+        )
+
+    return dispatcher_factory, watchdog_factory
+
+
+__all__ = [
+    "ClosedLoopRunner",
+    "NoOpDispatch",
+    "NoOpWatchdog",
+    "make_production_factories",
+]

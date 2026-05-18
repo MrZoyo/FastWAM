@@ -35,7 +35,7 @@ from fastwam.server.rotation import quat_xyzw_to_rpy
 from fastwam.server.ws_ingest import WSFrameIngester
 
 try:
-    from fastwam.server.closed_loop import ClosedLoopRunner  # type: ignore
+    from fastwam.server.closed_loop import ClosedLoopRunner, make_production_factories  # type: ignore
     _CLOSED_LOOP_AVAILABLE = True
 except ImportError:  # pragma: no cover - exercised only before PR5
     _CLOSED_LOOP_AVAILABLE = False
@@ -461,6 +461,8 @@ def main(argv: list[str] | None = None) -> None:
         ws_hold_stale_ms=args.ws_hold_stale_ms,
         ws_estop_stale_ms=args.ws_estop_stale_ms,
         default_instruction=args.instruction,
+        dispatcher_factory=make_production_factories()[0],
+        watchdog_factory=make_production_factories()[1],
     )
 
     if not args.skip_warmup:
