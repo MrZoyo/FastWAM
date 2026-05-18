@@ -325,7 +325,11 @@ def make_handler(arm: ArmClient, ws: WSFrameIngester, runner: Any) -> type[BaseH
                         return self._json(HTTPStatus.BAD_REQUEST,
                                           {"error": "instruction must be a string"})
                     with op_lock:
-                        arm.acquire_control()
+                        # PR9 R9: refuse to start when lease + servo_control + speed setup fails;
+                        # otherwise InferLoop runs but every send_pose returns False -> repeated estop.
+                        if not arm.acquire_control():
+                            return self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                                              {"error": "arm.acquire_control failed (lease held by another client, or switch_controller failed)"})
                         runner.start(inst)
                     return self._json(HTTPStatus.OK,
                                       {"status": "started", "instruction": inst})
@@ -340,6 +344,14 @@ def make_handler(arm: ArmClient, ws: WSFrameIngester, runner: Any) -> type[BaseH
                         return self._json(HTTPStatus.BAD_REQUEST,
                                           {"error": "enable must be bool"})
                     with op_lock:
+                        # PR9 R3: stop dispatcher synchronously BEFORE the 150 ms
+                        # set_arm_emergency_stop SDK blocking call; otherwise dispatch
+                        # could fire 2-3 more 50 ms slots inside the estop window.
+                        if enable:
+                            try:
+                                runner._dispatch.set_hold(True, reason="emergency")
+                            except Exception:
+                                logger.exception("[emergency] dispatch.set_hold failed")
                         arm.emergency_stop(enable)
                     return self._json(HTTPStatus.OK,
                                       {"status": "emergency_stop_set", "enable": enable})
@@ -371,10 +383,24 @@ def make_handler(arm: ArmClient, ws: WSFrameIngester, runner: Any) -> type[BaseH
             action_abs = np.tile(pose_row[None, :], (chunk_len, 1))
             base_ts_ns = int(snap.capture_ts_ns)
             with op_lock:
-                # Requires ClosedLoopRunner.inject_chunk_for_debug from PR5.
-                runner.start(None)
-                runner.inject_chunk_for_debug(action_abs, base_ts_ns)
-            self._json(HTTPStatus.OK, {"status": "zero_pose_injected",
+                # PR9 R4: bypass the model. Starting runner.start() would let
+                # InferLoop push a real chunk ~400 ms later and overwrite the
+                # zero-pose entry. Only start the dispatcher; no InferLoop, no
+                # Watchdog. arm.acquire_control() is required for send_pose
+                # to take effect on hardware.
+                if not arm.acquire_control():
+                    return self._json(HTTPStatus.SERVICE_UNAVAILABLE,
+                                      {"error": "arm.acquire_control failed; cannot run zero-pose dry-test"})
+                try:
+                    runner.inject_chunk_for_debug(action_abs, base_ts_ns)
+                    runner.start_dispatch_only()
+                    time.sleep(duration_s)
+                finally:
+                    try: runner.stop_dispatch_only()
+                    except Exception: logger.exception("[zero_pose] dispatch.stop raised")
+                    try: arm.release_control()
+                    except Exception: logger.exception("[zero_pose] arm.release_control raised")
+            self._json(HTTPStatus.OK, {"status": "zero_pose_completed",
                                        "chunk_len": chunk_len,
                                        "duration_s": duration_s,
                                        "base_ts_ns": base_ts_ns})

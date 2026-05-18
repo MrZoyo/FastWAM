@@ -261,9 +261,26 @@ class ClosedLoopRunner:
 
     def emergency(self) -> None:
         self._stop_evt.set()
+        # PR9 R3: stop dispatch synchronously BEFORE the SDK emergency call so
+        # we don't keep firing pose targets during the 150 ms estop window.
+        try: self._dispatch.set_hold(True, reason="emergency")
+        except Exception: self._logger.exception("[runner] dispatch.set_hold raised")
         try: self.arm_client.emergency_stop(True)
         except Exception: self._logger.exception("[runner] arm.emergency_stop raised")
         self.stop()
+
+    # ---- debug / dry-test hooks --------------------------------------------
+    def start_dispatch_only(self) -> None:
+        """Start just the dispatcher (no InferLoop, no Watchdog).
+
+        Used by /debug/zero_pose_test so an injected zero-pose chunk is the only
+        thing the dispatcher sees (the model never runs).
+        """
+        self._dispatch.start()
+
+    def stop_dispatch_only(self) -> None:
+        try: self._dispatch.stop()
+        except Exception: self._logger.exception("[runner] dispatch.stop raised")
 
     # ------------------------------------------------------------------
     # status

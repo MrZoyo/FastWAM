@@ -81,6 +81,13 @@ class DispatchLoop:
         if self._thread is not None:
             raise RuntimeError("DispatchLoop.start called twice")
         self._stop_evt.clear()
+        # PR9 R11: previous _trigger_emergency leaves hold_mode=True. If we
+        # didn't clear it here, a subsequent /start would silently skip every
+        # dispatch slot forever.
+        with self._state_lock:
+            self._metrics.hold_mode = False
+            self._metrics.hold_reason = ""
+            self._metrics.rpy_jump_streak = 0
         self._thread = threading.Thread(
             target=self._run, name="DispatchLoop", daemon=True
         )

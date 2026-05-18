@@ -135,6 +135,13 @@ class MockClosedLoopRunner:
     def inject_chunk_for_debug(self, action_abs: np.ndarray, base_ts_ns: int) -> None:
         self.inject_calls.append((np.array(action_abs), int(base_ts_ns)))
 
+    # PR9 R4: handler now starts/stops the dispatcher directly (no InferLoop).
+    def start_dispatch_only(self) -> None:
+        self.dispatch_start_count = getattr(self, "dispatch_start_count", 0) + 1
+
+    def stop_dispatch_only(self) -> None:
+        self.dispatch_stop_count = getattr(self, "dispatch_stop_count", 0) + 1
+
 
 # ---------------------------------------------------------------------------
 # HTTP-handler fixtures
@@ -335,12 +342,15 @@ def test_post_zero_pose_test_injects_chunk(http_server):
     code, body = _request("POST", f"{http_server['url']}/debug/zero_pose_test",
                           {"duration_s": 2.5})
     assert code == 200
-    assert body["status"] == "zero_pose_injected"
+    assert body["status"] == "zero_pose_completed"
     assert body["chunk_len"] == 32
     assert body["duration_s"] == 2.5
     runner: MockClosedLoopRunner = http_server["runner"]
-    # Must start the runner (so dispatcher is alive) AND inject the chunk.
-    assert None in runner.start_calls
+    # PR9 R4: must NOT start the full runner (would let InferLoop overwrite the
+    # zero chunk). Only dispatcher should run, and chunk must be injected.
+    assert runner.start_calls == []
+    assert getattr(runner, "dispatch_start_count", 0) == 1
+    assert getattr(runner, "dispatch_stop_count", 0) == 1
     assert len(runner.inject_calls) == 1
     action_abs, base_ts = runner.inject_calls[0]
     assert action_abs.shape == (32, 7)
