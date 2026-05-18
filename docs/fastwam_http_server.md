@@ -5,19 +5,19 @@ It uses only the Python standard library for HTTP, so it does not require FastAP
 
 Incoming RGB frames are routed by their actual `(H, W)`:
 
-- **1088x1280** raw stereo frames: the server undistorts each eye at native resolution,
-  then resizes to `480x640` per camera with `cv2.INTER_AREA`. Requires OpenCV. The
-  per-camera calibration may come from the request (`undistort.left_camera_info` /
+- **1088x1280** raw stereo frames: the server undistorts each eye at native resolution
+  and hands the resulting 1088x1280 frames directly to the model client. There is
+  *no* server-side `cv2.resize` to 480x640 — the aspect-preserving short-side resize
+  and center crop to `224x448` (each eye 224x224) happen inside
+  `FastWAMModelClient._preprocess_image`, matching the training-time transform.
+  Calibration may come from the request (`undistort.left_camera_info` /
   `right_camera_info`) or from the server-side default file loaded at startup via
-  `--default-camera-info` (see [Server-side defaults](#server-side-defaults)). Anything
-  provided in the payload takes precedence over the default for that camera.
+  `--default-camera-info` (see [Server-side defaults](#server-side-defaults)).
+  Anything provided in the payload takes precedence over the default for that camera.
 - **480x640** training-aligned frames: passed through as-is. Any `undistort` field in the
   payload is ignored. OpenCV is not required.
 - Any other resolution returns HTTP 400. All camera streams in a single request must share
   the same resolution.
-
-Once images reach `480x640`, the model-side pipeline (short-side resize to 480, center-crop
-to `224x224`, normalize to `[-1, 1]`) runs unchanged.
 
 ## Prepare real_1048 Assets
 
@@ -77,13 +77,12 @@ PyTorch still reports the selected visible GPU as `cuda:0`.
 
 - `GET /health`: model metadata, required camera keys, `proprio_dim`, horizon. Also reports
   `accepted_image_resolutions=[[1088,1280],[480,640]]`, `undistort_required_at=[1088,1280]`,
-  and `resize_interpolation="cv2.INTER_AREA"`. When the server is launched with
+  and `image_pipeline="undistort_only (model client handles stitch+resize+crop)"`. When the server is launched with
   `--default-camera-info` pointing at a valid JSON file, it additionally reports
   `default_camera_info_loaded=true`, `default_camera_info_path`,
   `default_camera_info_keys` (list of image keys with defaults), `default_stereo_pair`
   (e.g. `{"left": "head_left", "right": "right_wrist_left"}`), and the
   `default_instruction` that the server uses when a client omits `instruction`.
-- `GET /schema`: compact request/response schema.
 - `POST /infer`: run inference.
 - `POST /predict_action`: alias of `/infer`.
 
@@ -189,11 +188,13 @@ EEF deltas `pose[t+1] - pose[t]`.
 
 For the `1088x1280` path, the server treats the two model images as a stereo pair and runs
 OpenCV undistortion/rectification at **native resolution** (no `K` scaling — calibration must
-match the source resolution). Each eye is then resized to `480x640` with `cv2.INTER_AREA`
-before entering the training pipeline. `left_to_right` is optional: when provided, OpenCV
-performs stereo rectification; otherwise each eye is undistorted independently with its own
-`K`/`d`. The legacy fields `undistort.enabled` and `undistort.output_size` are no longer
-honored — they are silently ignored.
+match the source resolution). The undistorted 1088x1280 frames are handed straight to the
+model client; `FastWAMModelClient._preprocess_image` stitches the two eyes horizontally,
+applies aspect-preserving short-side resize, and center-crops to `224x448` (each eye 224x224).
+`left_to_right` is optional: when provided, OpenCV performs stereo rectification; otherwise
+each eye is undistorted independently with its own `K`/`d`. The legacy fields
+`undistort.enabled` and `undistort.output_size` are no longer honored — they are silently
+ignored.
 
 For the `480x640` path, the server skips all OpenCV work; any `undistort` payload is ignored.
 This is the right choice if the client has already undistorted and resized upstream.
@@ -249,8 +250,8 @@ closed loop.
 | Port (default) | 8117 | 8118 |
 | Frame source | Client POSTs base64 PNG/JPEG | Server pulls from `rgbd_ws_bridge` WS |
 | ARM state | Client supplies `proprio_raw` + `current_position` | Server polls `arm_sdk` directly |
-| Image normalization | server resizes 1088x1280 → 480x640 before model | server only undistorts; model_clients does stitch + resize + crop |
-| Endpoints | `POST /infer`, `GET /health`, `GET /schema` | `POST /start /stop /emergency /debug/zero_pose_test`, `GET /health /closed_loop_status /ws_status` |
+| Image normalization | undistort only; model_clients does stitch + resize + crop | same — no server-side resize on either path |
+| Endpoints | `POST /infer`, `GET /health` | `POST /start /stop /emergency /debug/zero_pose_test`, `GET /health /closed_loop_status /ws_status` |
 | Use when | Offline replay, integration testing | Real-time autonomy on hardware |
 
 The v2 server never exposes `/infer`; the model is driven by the internal

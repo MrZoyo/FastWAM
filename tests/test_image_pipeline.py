@@ -107,14 +107,14 @@ def test_undistort_native_missing_stereo_key_raises(default_camera_info, stereo_
         )
 
 
-def test_legacy_normalize_image_resolution_resizes_to_train_shape(
+def test_legacy_normalize_image_resolution_returns_native_shape(
     native_images, default_camera_info, stereo_pair
 ):
-    """Old server still returns 480x640 to keep /infer behaviour unchanged."""
+    """Server now hands undistorted 1088x1280 straight to the model client
+    (which internally stitches + resizes + center-crops to 224x448). Used to
+    cv2.resize down to 480x640; that step was removed for parity with the v2
+    active-loop server."""
     module = _load_http_server_module()
-
-    # Inject server-side defaults so the legacy helper accepts the request
-    # without an explicit `undistort` payload section.
     module._DEFAULT_CAMERA_INFO.clear()
     module._DEFAULT_CAMERA_INFO.update(default_camera_info)
     module._DEFAULT_STEREO_PAIR.clear()
@@ -124,7 +124,7 @@ def test_legacy_normalize_image_resolution_resizes_to_train_shape(
 
     assert set(out.keys()) == set(native_images.keys())
     for key, arr in out.items():
-        assert arr.shape == (480, 640, 3), f"{key} shape={arr.shape}"
+        assert arr.shape == (1088, 1280, 3), f"{key} shape={arr.shape}"
         assert arr.dtype == np.uint8
 
 

@@ -18,11 +18,13 @@ POST /infer expects JSON:
   }
 
 Images must be either (H=1088, W=1280) raw frames (the payload then MUST
-include an "undistort" object with left_camera_info / right_camera_info, and
-the server undistorts at native resolution before resizing each camera to
-480x640 with cv2.INTER_AREA) or (H=480, W=640) frames already aligned with
-training (no undistort, no resize). All camera streams in a single request
-must share the same resolution; any other resolution returns 400.
+include an "undistort" object with left_camera_info / right_camera_info; the
+server undistorts at native resolution and hands the 1088x1280 result
+straight to the model -- aspect-preserving resize + center crop to 224x448
+happen inside ``FastWAMModelClient._preprocess_image``) or (H=480, W=640)
+frames already aligned with training (no undistort, no resize). All camera
+streams in a single request must share the same resolution; any other
+resolution returns 400.
 """
 
 from __future__ import annotations
@@ -48,11 +50,7 @@ if __package__ is None or __package__ == "":
 
 from fastwam.closed_loop_eval.model_clients import FastWAMModelClient
 from fastwam.server.image_pipeline import undistort_native
-from fastwam.utils.rgb_undistort import (
-    _require_cv2,
-    opencv_available,
-    undistort_stereo_side_from_camera_info,
-)
+from fastwam.utils.rgb_undistort import opencv_available
 
 
 logger = logging.getLogger(__name__)
@@ -187,8 +185,10 @@ def _normalize_image_resolution(
 ) -> dict[str, np.ndarray]:
     """Branch on the actual (H, W) of incoming images.
 
-    - 1088x1280: require stereo calibration, undistort at native resolution, then
-      cv2.resize each camera down to 480x640 with INTER_AREA.
+    - 1088x1280: require stereo calibration, undistort at native resolution
+      and return the 1088x1280 result. The model client applies the
+      training-time transform (stitch -> aspect-preserving resize ->
+      center crop to 224x448) internally.
     - 480x640:   pass through; any 'undistort' field in the payload is ignored.
     - other:     raise ValueError -> the handler turns it into a 400.
     """
@@ -209,12 +209,10 @@ def _normalize_image_resolution(
             raise ValueError(
                 f"Field 'images' must contain stereo keys '{left_key}' and '{right_key}'."
             )
-        left_ci = options.get("left_camera_info")
-        if not isinstance(left_ci, dict):
-            left_ci = _DEFAULT_CAMERA_INFO.get(left_key)
-        right_ci = options.get("right_camera_info")
-        if not isinstance(right_ci, dict):
-            right_ci = _DEFAULT_CAMERA_INFO.get(right_key)
+        left_ci = options.get("left_camera_info") if isinstance(options.get("left_camera_info"), dict) \
+            else _DEFAULT_CAMERA_INFO.get(left_key)
+        right_ci = options.get("right_camera_info") if isinstance(options.get("right_camera_info"), dict) \
+            else _DEFAULT_CAMERA_INFO.get(right_key)
         if not isinstance(left_ci, dict):
             raise ValueError(
                 f"No 'undistort.left_camera_info' in payload and no server default for "
@@ -232,8 +230,7 @@ def _normalize_image_resolution(
                 "left/right stereo; cannot undistort."
             )
 
-        cv = _require_cv2()
-        out = undistort_native(
+        return undistort_native(
             images,
             default_camera_info={left_key: left_ci, right_key: right_ci},
             stereo_pair={"left": left_key, "right": right_key},
@@ -242,10 +239,6 @@ def _normalize_image_resolution(
             rotation=options.get("rotation"),
             translation=options.get("translation"),
         )
-        target_wh = (_TRAIN_SHAPE[1], _TRAIN_SHAPE[0])  # cv2.resize takes (W, H)
-        for k in (left_key, right_key):
-            out[k] = cv.resize(out[k], target_wh, interpolation=cv.INTER_AREA)
-        return out
 
     raise ValueError(
         f"Unsupported image resolution (H, W)={hw}; expected "
@@ -305,56 +298,6 @@ def _request_to_model_input(payload: dict[str, Any]) -> dict[str, Any]:
     return model_input
 
 
-def _schema() -> dict[str, Any]:
-    return {
-        "endpoints": {
-            "GET /health": "server/model metadata",
-            "GET /schema": "request and response schema",
-            "POST /infer": "run FastWAM and return an action chunk",
-            "POST /predict_action": "alias of /infer",
-        },
-        "request": {
-            "instruction": (
-                "optional; if omitted (or empty/null), the server falls back to its "
-                "--instruction default. Must have a matching text-embedding cache."
-            ),
-            "images": (
-                "object mapping training camera keys to base64 PNG/JPEG RGB images; "
-                "all cameras must share the same resolution, either 1088x1280 (raw, "
-                "requires 'undistort' calibration) or 480x640 (already training-aligned)"
-            ),
-            "undistort": (
-                "optional when images are 1088x1280 and the server has a default "
-                "camera-info file loaded; payload fields override defaults per-key. "
-                "Ignored when images are 480x640."
-            ),
-            "undistort.left_image_key": "optional image key for the left stereo frame; defaults to the first model key",
-            "undistort.right_image_key": "optional image key for the right stereo frame; defaults to the second model key",
-            "undistort.left_camera_info": "required CameraInfo-style object for the left camera",
-            "undistort.right_camera_info": "required CameraInfo-style object for the right camera",
-            "undistort.left_to_right": "optional 4x4 transform or flattened 16 values for stereo rectification",
-            "undistort.rotation": "optional 3x3 stereo rotation, alternative to left_to_right",
-            "undistort.translation": "optional 3D stereo translation, alternative to left_to_right",
-            "undistort.alpha": "optional OpenCV free scaling parameter, default 0.0",
-            "proprio_raw": "raw model proprio vector; real_1048 uses [joint0..joint5, gripper]",
-            "current_position": "required 6D current EEF pose [x,y,z,roll,pitch,yaw] for delta6_abs_gripper modes; cartesian_position is accepted as an alias",
-        },
-        "response": {
-            "action_format": "cartesian_absolute",
-            "actions": "[T,7] absolute EEF action chunk [x,y,z,roll,pitch,yaw,gripper]",
-            "action_mode": "delta6_abs_gripper",
-            "action_semantics": "description of delta shifting/integration before the absolute action chunk is returned",
-            "normalized_action_shape": "[T,D] model output shape before denormalization",
-            "full_prompt": "prompt used to load the text embedding cache",
-        },
-        "example": {
-            "images": {"head_left": "<base64>", "right_wrist_left": "<base64>"},
-            "proprio_raw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04],
-            "current_position": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        },
-    }
-
-
 class FastWAMHandler(BaseHTTPRequestHandler):
     server_version = "FastWAMHTTP/0.1"
 
@@ -379,9 +322,6 @@ class FastWAMHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
             self._send_json(HTTPStatus.OK, {"status": "ok", **_SERVER_INFO})
-            return
-        if self.path == "/schema":
-            self._send_json(HTTPStatus.OK, _schema())
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": f"Unknown endpoint: {self.path}"})
 
@@ -499,7 +439,7 @@ def main(argv: list[str] | None = None) -> None:
         "opencv_available": opencv_available(),
         "accepted_image_resolutions": [list(_NATIVE_SHAPE), list(_TRAIN_SHAPE)],
         "undistort_required_at": list(_NATIVE_SHAPE),
-        "resize_interpolation": "cv2.INTER_AREA",
+        "image_pipeline": "undistort_only (model client handles stitch+resize+crop)",
         "default_camera_info_loaded": bool(_DEFAULT_CAMERA_INFO),
         "default_camera_info_path": _DEFAULT_CAMERA_INFO_PATH,
         "default_camera_info_keys": sorted(_DEFAULT_CAMERA_INFO.keys()),
