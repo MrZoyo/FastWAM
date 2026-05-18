@@ -1,0 +1,27 @@
+[
+  {
+    "offset": 0,
+    "length": 15936,
+    "pair_seq": 1000
+  },
+  {
+    "offset": 15936,
+    "length": 3744,
+    "pair_seq": 1001
+  },
+  {
+    "offset": 19680,
+    "length": 3924,
+    "pair_seq": 1002
+  },
+  {
+    "offset": 23604,
+    "length": 3322,
+    "pair_seq": 1003
+  },
+  {
+    "offset": 26926,
+    "length": 3110,
+    "pair_seq": 1004
+  }
+]
