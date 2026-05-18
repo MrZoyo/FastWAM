@@ -234,4 +234,132 @@ the last dimension is the predicted absolute gripper target.
 - `GET /health` reports `image_keys=["head_left","right_wrist_left"]`, `proprio_dim=7`, and checkpoint `step_020000.pt`.
 - `GET /health` also reports `opencv_available=true` on the 5090 runtime.
 - A real dataset frame returns HTTP 200 with `action_format="cartesian_absolute"` and `actions` shape `[32,7]` when the request includes the current EEF pose.
+
+---
+
+# Active Loop Server (v2, self-fetch mode)
+
+`scripts/fastwam_active_loop_server.py` is the v2 active-loop companion to
+the v1 passive server above. The v1 server stays unchanged on port `8117`;
+the v2 server listens on port `8118` and is responsible for driving its own
+closed loop.
+
+| | v1 passive (`fastwam_http_server.py`) | v2 active (`fastwam_active_loop_server.py`) |
+| --- | --- | --- |
+| Port (default) | 8117 | 8118 |
+| Frame source | Client POSTs base64 PNG/JPEG | Server pulls from `rgbd_ws_bridge` WS |
+| ARM state | Client supplies `proprio_raw` + `current_position` | Server polls `arm_sdk` directly |
+| Image normalization | server resizes 1088x1280 → 480x640 before model | server only undistorts; model_clients does stitch + resize + crop |
+| Endpoints | `POST /infer`, `GET /health`, `GET /schema` | `POST /start /stop /emergency /debug/zero_pose_test`, `GET /health /closed_loop_status /ws_status` |
+| Use when | Offline replay, integration testing | Real-time autonomy on hardware |
+
+The v2 server never exposes `/infer`; the model is driven by the internal
+`ClosedLoopRunner`. See
+`docs/fastwam_http_server_self_fetch_design.md` for the full design.
+
+## v2 Endpoints
+
+### `POST /start`
+
+Body (optional): `{"instruction": "open the door"}`. If `instruction` is
+absent or `null`, the runner uses the `--instruction` default and the
+existing precomputed text-embedding cache.
+
+The handler calls `arm.acquire_control()` first, then
+`runner.start(instruction)`. Both calls run under a single internal lock so
+concurrent `/start /stop` requests cannot interleave.
+
+### `POST /stop`
+
+No body. Calls `runner.stop()` then `arm.release_control()`.
+
+### `POST /emergency`
+
+Body (optional): `{"enable": true}` (default) or `{"enable": false}`. Maps
+directly to `arm_sdk.set_arm_emergency_stop(enable)`. After tripping the
+estop you MUST call `POST /emergency {"enable": false}` before the next
+`/start` request will succeed.
+
+### `GET /health`
+
+Returns `{"status": "ok", "server": "fastwam_active_loop_server", "arm":
+arm.health(), "ws": ws.health()}`. `arm.health()` includes
+`lease_alive`, `last_poll_age_ms`, `consecutive_fail`. `ws.health()` includes
+`last_frame_age_per_channel_ms`, `fps_5s`, `decode_fail_count`, etc.
+
+### `GET /closed_loop_status`
+
+Forwards `runner.status()` — chunk index, dispatch latency stats, watchdog
+status.
+
+### `GET /ws_status`
+
+Verbose `ws.health()` view (per-channel decode latencies, key-frame gaps,
+last reconnect reason). Useful for debugging dropped frames.
+
+### `POST /debug/zero_pose_test`
+
+Body: `{"duration_s": 5.0}`. Reads `arm.latest()`, builds a 32-frame chunk
+where every row is `[x, y, z, roll, pitch, yaw, gripper] = current EEF
+pose`, and injects it directly into the dispatcher (bypassing the model).
+The arm MUST NOT move. Any observed pose drift means the coordinate-system
+plumbing in `arm_client.send_pose` or the dispatcher's blend-and-extend is
+wrong; abort and fix the conversion before proceeding to a real `/start`.
+
+Internally calls `runner.start(None)` followed by
+`runner.inject_chunk_for_debug(action_abs, base_ts_ns)` (the latter ships
+with PR5). Returns 503 if no fresh `arm.latest()` is available.
+
+## Bring-up Checklist (mandatory before real `/start`)
+
+1. **Pre-compute text embeddings.** If the instruction differs from the
+   training-time prompt, run `scripts/precompute_text_embeds.py` and point
+   `--text-cache-dir` at the new cache. The runtime uses a single
+   text-embed cache entry — switching instructions live is unsupported.
+2. **Start upstream services in this order**: `arm_sdk` gRPC server →
+   `rgbd_ws_bridge` → `fastwam_active_loop_server.py`. The server's
+   startup self-check waits for the first WS frame (default timeout 30 s);
+   if it sees no frame it aborts with `exit(1)` rather than start with a
+   silent stream.
+3. **Pick GPU 1, not GPU 0.** Default `--device=cuda:1`. GPU 0 on `5090_1`
+   is reserved for the AirDC visual capture process and is usually pinned
+   at >40 % utilization. Override with `--device=cuda:0` only if AirDC is
+   confirmed offline.
+4. **Run the zero-pose dry-test FIRST.** With the arm powered on but
+   inside its safety enclosure: start the server, then
+   `POST /debug/zero_pose_test {"duration_s": 5.0}`. The arm must not
+   move. If it does, halt and diagnose the coordinate frame.
+5. **First closed-loop run uses `--auto-dispatch=false`.** This disables
+   SDK calls; the runner still runs inference and logs everything. Once
+   the chunk write rate, blend indices, and watchdog logs look healthy,
+   relaunch with `--auto-dispatch=true`.
+
+## Startup Banner (design §7.7.1)
+
+On launch the server prints (INFO level) a fixed banner enumerating
+`train_config_path`, `train.num_frames`, `chunk_len`, `action_output_dim`,
+`context_len`, `num_inference_steps`, `device`, `gpu_free_mem_gb`,
+`ws_url`, `ws_channels`, `arm_host:port`, `arm_lease_ms`,
+`infer_period_ms`, `send_period_ms`, `blend_frames`, `image_pipeline`,
+`scipy_version`, rotation-fingerprint result, warmup latency, benchmark
+percentiles. Any of the following abort the launch with `exit(1)`:
+
+- training-config / CLI mismatch
+- rotation fingerprint failure (scipy convention regression)
+- GPU free memory < `--require-gpu-mem-free-gb` (default 8 GiB)
+- benchmark `p50 > 500 ms`
+- WS startup self-check or 30 s first-frame timeout
+
+## Rollback (design §11)
+
+- **L0** — runtime softstop: pass `--auto-dispatch=false`. Inference and
+  logging continue; nothing is sent to the manipulator.
+- **L1** — image-pipeline rollback: pass
+  `--image-pipeline=lerobot_480x640` to reproduce the v1 stitch path.
+- **L2** — full process rollback: stop the v2 server, start the v1
+  passive `scripts/fastwam_http_server.py` on port 8117. The v1 path is
+  unchanged.
+- **L3** — code rollback: delete `src/fastwam/server/` and
+  `scripts/fastwam_active_loop_server.py`. All new code lives in
+  isolated paths so a single revert restores the pre-PR state.
 - Malformed requests return HTTP 400, including non-7D `proprio_raw` and missing camera keys.
