@@ -695,3 +695,138 @@ def test_send_pose_no_reacquire_when_lease_alive():
         assert h["consecutive_send_fail"] == 1, h
     finally:
         arm.stop()
+
+
+# ---------------------------------------------------------------------------
+# PR14: go_to_home (optional one-shot home move before /start)
+# ---------------------------------------------------------------------------
+def _go_to_home_default_angles() -> list[float]:
+    return [0.0, 0.0, 0.0, 1.5707963, 0.0, -1.5707963]
+
+
+def test_go_to_home_calls_move_joint_then_switches_back_to_servo():
+    """PR14: planning_control -> move_joint -> servo_control -> move_eef -> set_arm_speed."""
+    mock_sdk = _make_mock_sdk_client()
+    mock_sdk.move_joint.return_value = True
+    mock_sdk.move_eef.return_value = True
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        # caller is responsible for acquire_control; mimic that pre-state.
+        assert arm.acquire_control() is True
+        # acquire_control already called switch_controller(servo) + set_arm_speed.
+        # Reset the entire mock so we can assert just the go_to_home call sequence.
+        mock_sdk.reset_mock()
+        # _lease_id was cleared by reset_mock; restore it so the lease-loss
+        # path in any other method does not misfire.
+        mock_sdk._lease_id = None
+
+        angles = _go_to_home_default_angles()
+        ok = arm.go_to_home(angles, gripper_m=0.09, timeout_s=5.0)
+        assert ok is True
+
+        # Verify exact sequence of method names (filtered to the calls we care about).
+        from arm_sdk.client import Controller as _Controller
+        watched = {"switch_controller", "move_joint", "move_eef", "set_arm_speed"}
+        seen = [c[0] for c in mock_sdk.method_calls if c[0] in watched]
+        assert seen == [
+            "switch_controller",  # -> planning_control
+            "move_joint",
+            "switch_controller",  # -> servo_control
+            "move_eef",
+            "set_arm_speed",
+        ], seen
+
+        # Inspect the two switch_controller calls in order: planning then servo.
+        sw_calls = [c for c in mock_sdk.method_calls if c[0] == "switch_controller"]
+        assert sw_calls[0].args == (_Controller.planning_control,)
+        assert sw_calls[1].args == (_Controller.servo_control,)
+
+        # move_joint angles + blocking=True
+        mj_call = mock_sdk.move_joint.call_args
+        assert list(mj_call.args[0]) == pytest.approx(angles)
+        assert mj_call.args[1].blocking is True
+
+        # move_eef gripper + blocking=True
+        me_call = mock_sdk.move_eef.call_args
+        assert me_call.args[0] == pytest.approx(0.09)
+        assert me_call.args[1].blocking is True
+
+        # set_arm_speed restored to the configured per-joint speed
+        mock_sdk.set_arm_speed.assert_called_once_with([0.5] * 6)
+    finally:
+        arm.stop()
+
+
+def test_go_to_home_returns_false_on_move_joint_failure():
+    """When move_joint returns False, go_to_home returns False but still
+    rolls the controller back to servo_control (caller invariant)."""
+    mock_sdk = _make_mock_sdk_client()
+    mock_sdk.move_joint.return_value = False
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        assert arm.acquire_control() is True
+        mock_sdk.reset_mock()
+        mock_sdk._lease_id = None
+        # reset_mock clears return_value side too in newer mock versions; re-set.
+        mock_sdk.move_joint.return_value = False
+        mock_sdk.move_eef.return_value = True
+        mock_sdk.switch_controller.return_value = True
+
+        ok = arm.go_to_home(_go_to_home_default_angles(), 0.09, timeout_s=3.0)
+        assert ok is False
+
+        # move_eef must NOT have been invoked when move_joint failed.
+        mock_sdk.move_eef.assert_not_called()
+
+        # Rollback path: switch_controller(servo_control) called at least once.
+        from arm_sdk.client import Controller as _Controller
+        servo_calls = [
+            c for c in mock_sdk.switch_controller.call_args_list
+            if c.args == (_Controller.servo_control,)
+        ]
+        assert len(servo_calls) >= 1, (
+            f"expected at least one servo_control switch in rollback, "
+            f"got: {mock_sdk.switch_controller.call_args_list}"
+        )
+        # set_arm_speed re-applied as part of rollback to keep dispatcher consistent.
+        mock_sdk.set_arm_speed.assert_called_with([0.5] * 6)
+    finally:
+        arm.stop()
+
+
+def test_go_to_home_rejects_invalid_inputs():
+    mock_sdk = _make_mock_sdk_client()
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        assert arm.acquire_control() is True
+
+        # Wrong joint length (7 not 6).
+        with pytest.raises(ValueError):
+            arm.go_to_home([0.0] * 7, 0.09)
+        # Gripper out of [0, 0.15]
+        with pytest.raises(ValueError):
+            arm.go_to_home(_go_to_home_default_angles(), gripper_m=-0.01)
+        with pytest.raises(ValueError):
+            arm.go_to_home(_go_to_home_default_angles(), gripper_m=0.16)
+
+        # SDK move_joint must not have been called for any invalid input.
+        mock_sdk.move_joint.assert_not_called()
+    finally:
+        arm.stop()
+
+
+def test_go_to_home_requires_acquired():
+    """Calling go_to_home before acquire_control must raise RuntimeError."""
+    mock_sdk = _make_mock_sdk_client()
+    arm = _make_client(mock_sdk)
+    arm._test_start()
+    try:
+        # No acquire_control yet -> _acquired is False.
+        with pytest.raises(RuntimeError):
+            arm.go_to_home(_go_to_home_default_angles(), 0.09)
+        mock_sdk.move_joint.assert_not_called()
+    finally:
+        arm.stop()

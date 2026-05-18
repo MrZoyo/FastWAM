@@ -92,6 +92,35 @@ _FLAGS: list[tuple[str, dict[str, Any]]] = [
         ),
     }),
     ("--watchdog-period-ms", {"type": int, "default": 10}),
+    ("--init-home", {
+        "action": argparse.BooleanOptionalAction,
+        "default": False,
+        "help": (
+            "If True, after model load and ARM poller start, briefly acquire "
+            "control and move arm to a fixed home pose "
+            "(joints [0, 0, 0, pi/2, 0, -pi/2] rad, gripper 0.09 m) before "
+            "the HTTP server starts serving. Useful for ensuring a "
+            "consistent capture starting point. Default disabled (safe)."
+        ),
+    }),
+    ("--init-home-timeout-s", {
+        "type": float,
+        "default": 10.0,
+        "help": "Timeout for the init-home blocking move (seconds).",
+    }),
+    ("--init-home-joints", {
+        "type": str,
+        "default": "0,0,0,1.5707963,0,-1.5707963",
+        "help": (
+            "Comma-separated 6-DoF joint angles (rad) for init-home target. "
+            "Default approximates [0, 0, 0, pi/2, 0, -pi/2]."
+        ),
+    }),
+    ("--init-home-gripper", {
+        "type": float,
+        "default": 0.09,
+        "help": "Gripper opening (m) for init-home target (G2 nearly full open).",
+    }),
     ("--instruction", {"default": DEFAULT_INSTRUCTION}),
     ("--device", {"default": "cuda:1"}),
     ("--require-gpu-mem-free-gb", {"type": float, "default": 8.0}),
@@ -257,6 +286,11 @@ def print_startup_banner(args: argparse.Namespace,
         ("ws_channels         ", ", ".join(sorted(EXPECTED_WS_CHANNELS)) + "  (identity mapping)"),
         ("arm_host:port       ", f"{args.arm_host}:{args.arm_port}"),
         ("arm_lease_ms        ", f"{args.arm_lease_ms}     (SDK auto-renew @ 5s)"),
+        ("init_home           ",
+         (f"enabled, joints={args.init_home_joints}, "
+          f"gripper={args.init_home_gripper:.4f}, "
+          f"timeout_s={args.init_home_timeout_s:.1f}")
+         if getattr(args, "init_home", False) else "disabled"),
         ("infer_period_ms     ",
          f"{args.infer_period_ms}       ({1000.0 / max(1, args.infer_period_ms):.1f} Hz)"),
         ("send_period_ms      ",
@@ -424,6 +458,73 @@ def _parse_backoff_ms(text: str) -> list[int]:
     return out or [1000]
 
 
+def _parse_init_home_joints(text: str) -> list[float]:
+    """Parse '--init-home-joints' CSV into a 6-element float list.
+
+    Raises ValueError if the text does not parse into exactly 6 finite floats.
+    """
+    parts = [p.strip() for p in str(text).split(",") if p.strip()]
+    if len(parts) != 6:
+        raise ValueError(
+            f"--init-home-joints must have exactly 6 comma-separated values, got {len(parts)}"
+        )
+    try:
+        angles = [float(p) for p in parts]
+    except ValueError as exc:
+        raise ValueError(f"--init-home-joints contains non-float: {text!r}") from exc
+    for a in angles:
+        if not np.isfinite(a):
+            raise ValueError(f"--init-home-joints contains non-finite: {text!r}")
+    return angles
+
+
+def maybe_run_init_home(arm: Any, args: argparse.Namespace) -> bool:
+    """Run the optional pre-serve home move.
+
+    Returns True if init-home was skipped (--no-init-home / default) or it
+    successfully completed. Returns False on failure so the caller can abort.
+    Acquire/release-control is bracketed locally so /start can re-acquire.
+    """
+    if not getattr(args, "init_home", False):
+        return True
+    try:
+        angles = _parse_init_home_joints(args.init_home_joints)
+    except ValueError as exc:
+        logger.error("%s init-home: %s", BANNER, exc)
+        return False
+    logger.info(
+        "%s init-home: angles=%s gripper=%.4f timeout_s=%.2f",
+        BANNER, angles, float(args.init_home_gripper),
+        float(args.init_home_timeout_s),
+    )
+    if not arm.acquire_control():
+        logger.error("%s init-home: acquire_control failed", BANNER)
+        return False
+    try:
+        try:
+            ok = bool(arm.go_to_home(
+                angles, float(args.init_home_gripper),
+                timeout_s=float(args.init_home_timeout_s),
+            ))
+        except (ValueError, RuntimeError) as exc:
+            logger.error("%s init-home: go_to_home raised: %s", BANNER, exc)
+            return False
+        if not ok:
+            logger.error(
+                "%s init-home: go_to_home did not complete in %.2fs",
+                BANNER, float(args.init_home_timeout_s),
+            )
+            return False
+        logger.info("%s init-home: PASS", BANNER)
+        return True
+    finally:
+        # release so /start can re-acquire later.
+        try:
+            arm.release_control()
+        except Exception:  # pragma: no cover - best-effort
+            logger.exception("%s init-home: release_control raised", BANNER)
+
+
 def _load_default_camera_info(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     if not path.exists():
         raise FileNotFoundError(f"default camera-info not found at {path}")
@@ -465,6 +566,12 @@ def main(argv: list[str] | None = None) -> None:
     arm.start()
     if args.arm_acquire_on == "init" and not arm.acquire_control():
         logger.error("%s arm.acquire_control() returned False; abort.", BANNER)
+        sys.exit(1)
+
+    # PR14: optional one-shot home move before the HTTP server starts serving.
+    # Bracketed by its own acquire/release so /start can still re-acquire later.
+    if not maybe_run_init_home(arm, args):
+        arm.stop()
         sys.exit(1)
 
     ws = WSFrameIngester(

@@ -401,6 +401,59 @@ class ArmClient:
             self._consecutive_send_fail = 0
         return True
 
+    # PR14: blocking home move. Caller owns acquire/release_control. Switches
+    # planning_control for move_joint then servo_control for move_eef (planning
+    # rejects move_eef). Always restores servo + set_arm_speed before return.
+    def go_to_home(self, joint_angles_rad: list[float], gripper_m: float,
+                   timeout_s: float = 10.0) -> bool:
+        if self._client is None or not self._acquired:
+            raise RuntimeError("go_to_home requires start() + acquire_control()")
+        if len(joint_angles_rad) != 6:
+            raise ValueError(f"joint_angles_rad must have 6 entries, got {len(joint_angles_rad)}")
+        if not (0.0 <= float(gripper_m) <= 0.15):
+            raise ValueError(f"gripper_m out of [0, 0.15] m, got {gripper_m}")
+        if self._opts_cls is None:
+            raise RuntimeError("ArmControlOptions not resolved; start() not called")
+        try: from arm_sdk.client import Controller as _Controller
+        except Exception: _Controller = getattr(self._client, "_controller_enum", None)  # pragma: no cover
+        if _Controller is None or not hasattr(self._client, "switch_controller"):
+            raise RuntimeError("go_to_home: SDK Controller / switch_controller missing")
+        angles = [float(a) for a in joint_angles_rad]
+        timeout_ms = int(max(1.0, timeout_s) * 1000)
+        start_ns = time.time_ns()
+        self._logger.info("[arm] go_to_home start angles=%s gripper=%.4f timeout_s=%.2f",
+                          angles, float(gripper_m), float(timeout_s))
+        def _call(fn, *a, **kw):  # stubs may not accept timeout_ms kwarg
+            try: return fn(*a, **kw)
+            except TypeError: return fn(*a)
+        def _set_speed():
+            if hasattr(self._client, "set_arm_speed"):
+                try: self._client.set_arm_speed([self._arm_speed_rad_s] * 6)
+                except Exception: self._logger.exception("[arm] go_to_home: set_arm_speed raised")  # pragma: no cover
+        def _opts():
+            o = self._opts_cls(); o.blocking = True; return o
+        ok_overall = False
+        try:
+            if not bool(self._client.switch_controller(_Controller.planning_control)):
+                self._logger.error("[arm] go_to_home: switch->planning False"); return False
+            if not bool(_call(self._client.move_joint, angles, _opts(), timeout_ms=timeout_ms)):
+                self._logger.error("[arm] go_to_home: move_joint False"); return False
+            if not bool(self._client.switch_controller(_Controller.servo_control)):
+                self._logger.error("[arm] go_to_home: switch->servo False"); return False
+            if not bool(_call(self._client.move_eef, float(gripper_m), _opts(), timeout_ms=timeout_ms)):
+                self._logger.error("[arm] go_to_home: move_eef False"); return False
+            _set_speed(); ok_overall = True; return True
+        finally:
+            elapsed_ms = (time.time_ns() - start_ns) / 1e6
+            if not ok_overall:
+                try:  # best-effort rollback to servo + speed
+                    self._client.switch_controller(_Controller.servo_control)
+                    _set_speed()
+                except Exception:  # pragma: no cover
+                    self._logger.exception("[arm] go_to_home: restore raised")
+            self._logger.info("[arm] go_to_home done elapsed=%.1fms ok=%s",
+                              elapsed_ms, ok_overall)
+
     # ------------------------------------------------------------------
     # poller
     # ------------------------------------------------------------------

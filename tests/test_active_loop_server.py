@@ -57,6 +57,11 @@ class _MockArmSnapshot:
 class MockArmClient:
     """Drop-in replacement for ``ArmClient`` exposing the methods the server uses."""
 
+    # PR14: instance default for go_to_home behaviour; tests may flip this
+    # to simulate a failed home move.
+    go_to_home_return: bool = True
+    acquire_control_return: bool = True
+
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
         self._snap: _MockArmSnapshot | None = _MockArmSnapshot()
@@ -69,13 +74,22 @@ class MockArmClient:
 
     def acquire_control(self) -> bool:
         self.calls.append(("acquire_control", ()))
-        return True
+        return bool(self.acquire_control_return)
 
     def release_control(self) -> None:
         self.calls.append(("release_control", ()))
 
     def emergency_stop(self, enable: bool = True) -> None:
         self.calls.append(("emergency_stop", (enable,)))
+
+    def go_to_home(self, joint_angles_rad, gripper_m, timeout_s=10.0) -> bool:
+        self.calls.append(
+            ("go_to_home",
+             (list(map(float, joint_angles_rad)),
+              float(gripper_m),
+              float(timeout_s))),
+        )
+        return bool(self.go_to_home_return)
 
     def latest(self) -> _MockArmSnapshot | None:
         return self._snap
@@ -564,6 +578,93 @@ def test_load_default_camera_info_missing_stereo(tmp_path):
     f.write_text(json.dumps({"cameras": {"head_left": {}}}))
     with pytest.raises(ValueError):
         als._load_default_camera_info(f)
+
+
+# ---------------------------------------------------------------------------
+# PR14: --init-home flag + maybe_run_init_home() bootstrap helper
+# ---------------------------------------------------------------------------
+
+
+def test_init_home_flag_default_false():
+    """PR14: --init-home defaults to False (do not move at startup)."""
+    ns = als.build_argparser().parse_args([])
+    assert ns.init_home is False
+    # Defaults for the related knobs should still be parsed.
+    assert ns.init_home_timeout_s == pytest.approx(10.0)
+    assert ns.init_home_gripper == pytest.approx(0.09)
+    # Default joint string approximates [0,0,0,pi/2,0,-pi/2].
+    parsed = als._parse_init_home_joints(ns.init_home_joints)
+    assert len(parsed) == 6
+    assert parsed[3] == pytest.approx(np.pi / 2, abs=1e-6)
+    assert parsed[5] == pytest.approx(-np.pi / 2, abs=1e-6)
+
+
+def test_init_home_flag_enabled_and_disabled():
+    """PR14: BooleanOptionalAction supports both --init-home and --no-init-home."""
+    p = als.build_argparser()
+    assert p.parse_args(["--init-home"]).init_home is True
+    assert p.parse_args(["--no-init-home"]).init_home is False
+
+
+def test_init_home_joints_parsing_via_helper(mocks):
+    """PR14: --init-home --init-home-joints=... reaches arm.go_to_home angles unchanged."""
+    p = als.build_argparser()
+    ns = p.parse_args([
+        "--init-home",
+        "--init-home-joints", "0.1,0.2,0.3,0.4,0.5,0.6",
+        "--init-home-gripper", "0.08",
+        "--init-home-timeout-s", "3.5",
+    ])
+    arm: MockArmClient = mocks["arm"]
+    ok = als.maybe_run_init_home(arm, ns)
+    assert ok is True
+    # The mock must have observed go_to_home with the exact parsed values.
+    go_calls = [c for c in arm.calls if c[0] == "go_to_home"]
+    assert len(go_calls) == 1, arm.calls
+    angles, gripper, timeout_s = go_calls[0][1]
+    assert angles == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+    assert gripper == pytest.approx(0.08)
+    assert timeout_s == pytest.approx(3.5)
+    # acquire_control + release_control must bracket the call.
+    names = [c[0] for c in arm.calls]
+    assert names.count("acquire_control") == 1
+    assert names.count("release_control") == 1
+    assert names.index("acquire_control") < names.index("go_to_home")
+    assert names.index("go_to_home") < names.index("release_control")
+
+
+def test_maybe_run_init_home_disabled_is_noop(mocks):
+    """When --init-home is False the helper returns True without touching the arm."""
+    ns = als.build_argparser().parse_args([])
+    arm: MockArmClient = mocks["arm"]
+    assert als.maybe_run_init_home(arm, ns) is True
+    assert arm.calls == []
+
+
+def test_maybe_run_init_home_failure_propagates(mocks):
+    """If arm.go_to_home returns False the helper returns False and releases control."""
+    arm: MockArmClient = mocks["arm"]
+    arm.go_to_home_return = False
+    ns = als.build_argparser().parse_args(["--init-home"])
+    assert als.maybe_run_init_home(arm, ns) is False
+    # release_control must still be invoked so /start can re-acquire.
+    assert ("release_control", ()) in arm.calls
+
+
+def test_maybe_run_init_home_acquire_failure(mocks):
+    """If arm.acquire_control returns False, go_to_home is never called."""
+    arm: MockArmClient = mocks["arm"]
+    arm.acquire_control_return = False
+    ns = als.build_argparser().parse_args(["--init-home"])
+    assert als.maybe_run_init_home(arm, ns) is False
+    assert all(c[0] != "go_to_home" for c in arm.calls)
+
+
+def test_parse_init_home_joints_wrong_length():
+    with pytest.raises(ValueError):
+        als._parse_init_home_joints("0,1,2,3,4")
+    with pytest.raises(ValueError):
+        als._parse_init_home_joints("0,1,2,3,4,5,6")
 
 
 # ---------------------------------------------------------------------------
