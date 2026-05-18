@@ -5,8 +5,8 @@ Start from the repo root:
 
   .venv/bin/python -B scripts/fastwam_http_server.py \
     --config configs/task/real_1048_uncond_2cam224_1e-4.yaml \
-    --checkpoint runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/checkpoints/weights/step_020000.pt \
-    --dataset-stats runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/dataset_stats.json \
+    --checkpoint runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/checkpoints/step_020000.pt \
+    --dataset-stats runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/dataset_stats.json \
     --text-cache-dir data/text_embeds_cache/real_1048
 
 POST /infer expects JSON:
@@ -63,6 +63,63 @@ _SERVER_INFO: dict[str, Any] = {}
 _NATIVE_SHAPE: tuple[int, int] = (1088, 1280)  # (H, W) raw stereo frames
 _TRAIN_SHAPE: tuple[int, int] = (480, 640)     # (H, W) training-aligned frames
 
+# Server-side defaults so clients can omit `instruction` / `undistort`.
+_DEFAULT_CAMERA_INFO: dict[str, dict[str, Any]] = {}   # key = image_key, value = camera_info dict
+_DEFAULT_STEREO_PAIR: dict[str, str] = {}              # {"left": "head_left", "right": "right_wrist_left"}
+_DEFAULT_INSTRUCTION: str | None = None
+_DEFAULT_CAMERA_INFO_PATH: str | None = None
+
+
+def _load_default_camera_info(path: Path) -> None:
+    """Populate _DEFAULT_CAMERA_INFO / _DEFAULT_STEREO_PAIR from JSON on disk.
+
+    Missing or malformed files only emit a warning; the server keeps the legacy
+    behavior of requiring an explicit `undistort` payload.
+    """
+    global _DEFAULT_CAMERA_INFO, _DEFAULT_STEREO_PAIR, _DEFAULT_CAMERA_INFO_PATH
+
+    if not path.exists():
+        logger.warning(
+            "Default camera-info file not found at %s; "
+            "1088x1280 requests will still require an explicit 'undistort' payload.",
+            path,
+        )
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to parse default camera-info %s: %s", path, exc)
+        return
+
+    cameras = data.get("cameras") if isinstance(data, dict) else None
+    if not isinstance(cameras, dict) or not cameras:
+        logger.warning(
+            "Default camera-info %s missing a non-empty 'cameras' object; skipping.", path
+        )
+        return
+
+    pair = data.get("stereo_pair") if isinstance(data, dict) else None
+    stereo_pair: dict[str, str] = {}
+    if isinstance(pair, dict):
+        left = pair.get("left")
+        right = pair.get("right")
+        if isinstance(left, str) and isinstance(right, str):
+            stereo_pair = {"left": left, "right": right}
+        else:
+            logger.warning(
+                "Default camera-info %s has invalid stereo_pair=%r; ignoring.", path, pair
+            )
+
+    _DEFAULT_CAMERA_INFO = {str(k): v for k, v in cameras.items() if isinstance(v, dict)}
+    _DEFAULT_STEREO_PAIR = stereo_pair
+    _DEFAULT_CAMERA_INFO_PATH = str(path)
+    logger.info(
+        "Loaded default camera-info from %s (cameras=%s, stereo_pair=%s)",
+        path,
+        sorted(_DEFAULT_CAMERA_INFO.keys()),
+        _DEFAULT_STEREO_PAIR or None,
+    )
+
 
 def _to_jsonable(value: Any) -> Any:
     if isinstance(value, np.ndarray):
@@ -100,10 +157,18 @@ def _image_hw(arr: np.ndarray) -> tuple[int, int]:
 
 
 def _stereo_image_keys(options: dict[str, Any]) -> tuple[str, str]:
+    # 1) Payload overrides win.
     left_key = options.get("left_image_key") or options.get("left_key")
     right_key = options.get("right_image_key") or options.get("right_key")
     if left_key is not None and right_key is not None:
         return str(left_key), str(right_key)
+    # 2) Server-side default stereo pair (if loaded).
+    if _DEFAULT_STEREO_PAIR:
+        default_left = _DEFAULT_STEREO_PAIR.get("left")
+        default_right = _DEFAULT_STEREO_PAIR.get("right")
+        if isinstance(default_left, str) and isinstance(default_right, str):
+            return default_left, default_right
+    # 3) Fall back to the model's first two image keys.
     if _CLIENT is None:
         raise RuntimeError("Model is not initialized.")
     keys = list(_CLIENT.image_shapes.keys())
@@ -136,23 +201,28 @@ def _normalize_image_resolution(
         return images
 
     if hw == _NATIVE_SHAPE:
-        options = payload.get("undistort")
-        if not isinstance(options, dict):
-            raise ValueError(
-                "Images at 1088x1280 require an 'undistort' object with "
-                "left_camera_info/right_camera_info for native-resolution undistortion."
-            )
+        raw_options = payload.get("undistort")
+        options: dict[str, Any] = raw_options if isinstance(raw_options, dict) else {}
         left_key, right_key = _stereo_image_keys(options)
         if left_key not in images or right_key not in images:
             raise ValueError(
                 f"Field 'images' must contain stereo keys '{left_key}' and '{right_key}'."
             )
         left_ci = options.get("left_camera_info")
+        if not isinstance(left_ci, dict):
+            left_ci = _DEFAULT_CAMERA_INFO.get(left_key)
         right_ci = options.get("right_camera_info")
-        if not isinstance(left_ci, dict) or not isinstance(right_ci, dict):
+        if not isinstance(right_ci, dict):
+            right_ci = _DEFAULT_CAMERA_INFO.get(right_key)
+        if not isinstance(left_ci, dict):
             raise ValueError(
-                "Field 'undistort' must provide 'left_camera_info' and "
-                "'right_camera_info' objects when images are 1088x1280."
+                f"No 'undistort.left_camera_info' in payload and no server default for "
+                f"image key '{left_key}'; cannot undistort 1088x1280 frames."
+            )
+        if not isinstance(right_ci, dict):
+            raise ValueError(
+                f"No 'undistort.right_camera_info' in payload and no server default for "
+                f"image key '{right_key}'; cannot undistort 1088x1280 frames."
             )
         leftover = [k for k in images if k not in (left_key, right_key)]
         if leftover:
@@ -233,8 +303,11 @@ def _request_to_model_input(payload: dict[str, Any]) -> dict[str, Any]:
                 "delta6_abs_gripper action modes. It must be the current 6D EEF pose, "
                 "not joint proprio_raw[:6]."
             )
-    if "instruction" in payload and payload["instruction"] is not None:
-        model_input["instruction"] = str(payload["instruction"])
+    payload_instruction = payload.get("instruction")
+    if isinstance(payload_instruction, str) and payload_instruction.strip():
+        model_input["instruction"] = payload_instruction
+    elif _DEFAULT_INSTRUCTION:
+        model_input["instruction"] = _DEFAULT_INSTRUCTION
     return model_input
 
 
@@ -247,16 +320,19 @@ def _schema() -> dict[str, Any]:
             "POST /predict_action": "alias of /infer",
         },
         "request": {
-            "instruction": "optional string; must have a matching text cache when text encoder is not loaded",
+            "instruction": (
+                "optional; if omitted (or empty/null), the server falls back to its "
+                "--instruction default. Must have a matching text-embedding cache."
+            ),
             "images": (
                 "object mapping training camera keys to base64 PNG/JPEG RGB images; "
                 "all cameras must share the same resolution, either 1088x1280 (raw, "
                 "requires 'undistort' calibration) or 480x640 (already training-aligned)"
             ),
             "undistort": (
-                "required when images are 1088x1280; ignored when images are 480x640. "
-                "Stereo calibration object used to undistort at native resolution before "
-                "the server resizes each camera to 480x640 with cv2.INTER_AREA."
+                "optional when images are 1088x1280 and the server has a default "
+                "camera-info file loaded; payload fields override defaults per-key. "
+                "Ignored when images are 480x640."
             ),
             "undistort.left_image_key": "optional image key for the left stereo frame; defaults to the first model key",
             "undistort.right_image_key": "optional image key for the right stereo frame; defaults to the second model key",
@@ -278,15 +354,9 @@ def _schema() -> dict[str, Any]:
             "full_prompt": "prompt used to load the text embedding cache",
         },
         "example": {
-            "instruction": "open the door",
             "images": {"head_left": "<base64>", "right_wrist_left": "<base64>"},
             "proprio_raw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04],
-            "undistort": {
-                "left_image_key": "head_left",
-                "right_image_key": "right_wrist_left",
-                "left_camera_info": {"width": 1280, "height": 1088, "k": "[...]", "d": "[...]"},
-                "right_camera_info": {"width": 1280, "height": 1088, "k": "[...]", "d": "[...]"},
-            },
+            "current_position": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         },
     }
 
@@ -370,11 +440,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="configs/task/real_1048_uncond_2cam224_1e-4.yaml")
     parser.add_argument(
         "--checkpoint",
-        default="runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/checkpoints/weights/step_020000.pt",
+        default="runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/checkpoints/step_020000.pt",
     )
     parser.add_argument(
         "--dataset-stats",
-        default="runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/dataset_stats.json",
+        default="runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/dataset_stats.json",
     )
     parser.add_argument("--text-cache-dir", default="data/text_embeds_cache/real_1048")
     parser.add_argument("--instruction", default="open the door")
@@ -389,15 +459,33 @@ def build_argparser() -> argparse.ArgumentParser:
         default="delta6_abs_gripper",
     )
     parser.add_argument("--output-action-format", default="cartesian_absolute")
+    parser.add_argument(
+        "--default-camera-info",
+        default="configs/camera_info/real_1048_default.json",
+        help=(
+            "JSON file with default per-camera calibration so clients can omit "
+            "'undistort' on 1088x1280 requests. Relative paths resolve to the repo root."
+        ),
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser
 
 
 def main(argv: list[str] | None = None) -> None:
-    global _CLIENT, _SERVER_INFO
+    global _CLIENT, _SERVER_INFO, _DEFAULT_INSTRUCTION
 
     args = build_argparser().parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
+
+    # Resolve and load default camera-info (best-effort, never fatal).
+    repo_root = Path(__file__).resolve().parents[1]
+    default_camera_info_path = Path(args.default_camera_info).expanduser()
+    if not default_camera_info_path.is_absolute():
+        default_camera_info_path = (repo_root / default_camera_info_path).resolve()
+    _load_default_camera_info(default_camera_info_path)
+
+    _DEFAULT_INSTRUCTION = args.instruction if isinstance(args.instruction, str) and args.instruction else None
+
     logger.info("Loading FastWAM model from %s", args.checkpoint)
     _CLIENT = _init_client(args)
     _SERVER_INFO = {
@@ -418,6 +506,11 @@ def main(argv: list[str] | None = None) -> None:
         "accepted_image_resolutions": [list(_NATIVE_SHAPE), list(_TRAIN_SHAPE)],
         "undistort_required_at": list(_NATIVE_SHAPE),
         "resize_interpolation": "cv2.INTER_AREA",
+        "default_camera_info_loaded": bool(_DEFAULT_CAMERA_INFO),
+        "default_camera_info_path": _DEFAULT_CAMERA_INFO_PATH,
+        "default_camera_info_keys": sorted(_DEFAULT_CAMERA_INFO.keys()),
+        "default_stereo_pair": dict(_DEFAULT_STEREO_PAIR),
+        "default_instruction": _DEFAULT_INSTRUCTION,
     }
 
     httpd = ThreadingHTTPServer((args.host, args.port), FastWAMHandler)

@@ -5,9 +5,12 @@ It uses only the Python standard library for HTTP, so it does not require FastAP
 
 Incoming RGB frames are routed by their actual `(H, W)`:
 
-- **1088x1280** raw stereo frames: the payload **must** include an `undistort` object with
-  `left_camera_info` and `right_camera_info`. The server undistorts each eye at native
-  resolution, then resizes to `480x640` per camera with `cv2.INTER_AREA`. Requires OpenCV.
+- **1088x1280** raw stereo frames: the server undistorts each eye at native resolution,
+  then resizes to `480x640` per camera with `cv2.INTER_AREA`. Requires OpenCV. The
+  per-camera calibration may come from the request (`undistort.left_camera_info` /
+  `right_camera_info`) or from the server-side default file loaded at startup via
+  `--default-camera-info` (see [Server-side defaults](#server-side-defaults)). Anything
+  provided in the payload takes precedence over the default for that camera.
 - **480x640** training-aligned frames: passed through as-is. Any `undistort` field in the
   payload is ignored. OpenCV is not required.
 - Any other resolution returns HTTP 400. All camera streams in a single request must share
@@ -23,8 +26,8 @@ The default service target is `real_1048_uncond_2cam224_1e-4`.
 Required local paths:
 
 - dataset: `/data_hdd/Lyle/Datasets/real_1048`
-- checkpoint: `runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/checkpoints/weights/step_020000.pt`
-- dataset stats: `runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/dataset_stats.json`
+- checkpoint: `runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/checkpoints/step_020000.pt`
+- dataset stats: `runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/dataset_stats.json`
 - text cache: `data/text_embeds_cache/real_1048`
 
 Generate stats and text cache from the repo root if they are missing:
@@ -37,7 +40,7 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from fastwam.utils.misc import register_work_dir
 
-run_dir = Path("runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105").resolve()
+run_dir = Path("runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15").resolve()
 register_work_dir(run_dir)
 with initialize_config_dir(config_dir=str(Path("configs").resolve()), version_base=None):
     cfg = compose(config_name="train", overrides=["task=real_1048_uncond_2cam224_1e-4"])
@@ -62,8 +65,8 @@ CUDA_VISIBLE_DEVICES=1 \
   --host 0.0.0.0 \
   --port 8117 \
   --config configs/task/real_1048_uncond_2cam224_1e-4.yaml \
-  --checkpoint runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/checkpoints/weights/step_020000.pt \
-  --dataset-stats runs/real_1048_uncond_2cam224_1e-4/real1048_20k_wandb_20260508_202105/dataset_stats.json \
+  --checkpoint runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/checkpoints/step_020000.pt \
+  --dataset-stats runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/dataset_stats.json \
   --text-cache-dir data/text_embeds_cache/real_1048
 ```
 
@@ -74,14 +77,60 @@ PyTorch still reports the selected visible GPU as `cuda:0`.
 
 - `GET /health`: model metadata, required camera keys, `proprio_dim`, horizon. Also reports
   `accepted_image_resolutions=[[1088,1280],[480,640]]`, `undistort_required_at=[1088,1280]`,
-  and `resize_interpolation="cv2.INTER_AREA"`.
+  and `resize_interpolation="cv2.INTER_AREA"`. When the server is launched with
+  `--default-camera-info` pointing at a valid JSON file, it additionally reports
+  `default_camera_info_loaded=true`, `default_camera_info_path`,
+  `default_camera_info_keys` (list of image keys with defaults), `default_stereo_pair`
+  (e.g. `{"left": "head_left", "right": "right_wrist_left"}`), and the
+  `default_instruction` that the server uses when a client omits `instruction`.
 - `GET /schema`: compact request/response schema.
 - `POST /infer`: run inference.
 - `POST /predict_action`: alias of `/infer`.
 
+## Server-side defaults
+
+Two payload fields can be omitted by the client and resolved server-side:
+
+- `instruction`: when the request omits this field, sends `null`, or sends an empty string,
+  the server uses its `--instruction` CLI default (`"open the door"` by default for
+  real_1048). A matching text-embedding cache must still exist under `--text-cache-dir`.
+- `undistort` (1088x1280 path only): when the server starts with a valid
+  `--default-camera-info` JSON (default: `configs/camera_info/real_1048_default.json`), it
+  loads `{stereo_pair, cameras}` so that 1088x1280 requests no longer need to include
+  any `undistort` block. The `cameras` map is keyed by image key (e.g. `head_left`,
+  `right_wrist_left`) and provides the per-camera `k`/`d` used for native-resolution
+  undistortion. The optional `stereo_pair` overrides the stereo-key lookup fallback
+  (which would otherwise pull the first two keys from `image_shapes`).
+
+Payload values always win over server defaults at field granularity: a request can supply
+`left_camera_info` only and the server will still fill in `right_camera_info` from the
+default file. Setting either `instruction` or any individual `undistort.*` field in the
+payload disables only that specific override.
+
+The minimal client-side request therefore needs just `images`, `proprio_raw`, and the
+`current_position` required by delta action modes. Note that the `proprio_raw`,
+`images`, and `current_position` validations are unchanged.
+
 ## POST /infer Request
 
-### Raw `1088x1280` stereo (requires `undistort` calibration)
+The examples below show the new minimal payloads. `instruction` and `undistort` can
+still be supplied — when present they take precedence over the server defaults.
+
+### Raw `1088x1280` stereo (minimal request, server defaults supply calibration)
+
+```json
+{
+  "images": {
+    "head_left": "<base64 encoded png/jpeg, 1088x1280>",
+    "right_wrist_left": "<base64 encoded png/jpeg, 1088x1280>"
+  },
+  "proprio_raw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04],
+  "current_position": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+```
+
+If you need to override the server defaults (e.g. you have a freshly recalibrated rig),
+an explicit `undistort` block still works and wins per-field:
 
 ```json
 {
@@ -91,6 +140,7 @@ PyTorch still reports the selected visible GPU as `cuda:0`.
     "right_wrist_left": "<base64 encoded png/jpeg, 1088x1280>"
   },
   "proprio_raw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04],
+  "current_position": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
   "undistort": {
     "left_image_key": "head_left",
     "right_image_key": "right_wrist_left",
@@ -111,16 +161,16 @@ PyTorch still reports the selected visible GPU as `cuda:0`.
 }
 ```
 
-### Already-aligned `480x640` frames
+### Already-aligned `480x640` frames (minimal request)
 
 ```json
 {
-  "instruction": "open the door",
   "images": {
     "head_left": "<base64 encoded png/jpeg, 480x640>",
     "right_wrist_left": "<base64 encoded png/jpeg, 480x640>"
   },
-  "proprio_raw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04]
+  "proprio_raw": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.04],
+  "current_position": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 }
 ```
 
@@ -156,8 +206,8 @@ The following malformed requests return HTTP 400:
 - non-7D `proprio_raw` or missing camera keys
 - images at a resolution other than `1088x1280` or `480x640`
 - cameras in the same request with mismatched resolutions
-- `1088x1280` images without an `undistort` object, or with `left_camera_info` /
-  `right_camera_info` missing
+- `1088x1280` images for which neither the payload nor the server-side default file
+  provides `left_camera_info` / `right_camera_info` for the resolved stereo keys
 - image bytes that are not `H x W x 3` `uint8` after base64 decoding
 
 ## Response
