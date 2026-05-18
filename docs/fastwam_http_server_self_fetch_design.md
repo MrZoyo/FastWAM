@@ -1,28 +1,41 @@
-# FastWAM HTTP Server — 服务器主动采集 + 主动下发改造设计
+# FastWAM Active Loop Server — 独立主动闭环服务设计
 
-> 版本：v1（设计稿） · 日期：2026-05-18 · 状态：仅设计，未实现
+> 版本：v2 · 日期：2026-05-18 · 状态：仅设计，未实现
+>
+> v2 关键变化（相对 v1）：
+> - **架构解耦**：放弃在 `scripts/fastwam_http_server.py` 内加 `--enable-self-fetch` 开关。旧 server **完全不动**，主动模式拆成**独立脚本** `scripts/fastwam_active_loop_server.py`。这样 `_INFER_LOCK` / `/infer` fallback / 向后兼容 flag 一整套都不需要。
+> - **WS / ARM probe 已跑通**，协议字段、通道名、分辨率、gripper 单位全部落实，原"未解项"清零。
+> - **图像流程简化**：1088×1280 → undistort → 直接交给 `FastWAMModelClient.infer()`，**不再额外 cv2.resize 到 480×640**（model_clients 内部 stitch+resize+crop 一步到位 224×448）。
+> - **lease**：信任 arm_sdk 内置 `acquire_control` 自动续期，**不外加 timer**。
 
 ## 0. TL;DR
 
-把 `scripts/fastwam_http_server.py` 从「客户端推 images + proprio + current_position」改成「服务器内置 WS 图像 ingester、ARM gRPC 异步状态缓存、chunked 异步下发循环、急停 watchdog」。
+新增 `scripts/fastwam_active_loop_server.py`，内部跑：
 
-最终客户端只剩两件事：
+- **WS 图像 ingester**（PyAV H.264 解码，双路 `head_left` / `right_wrist_left`）
+- **ARM 状态 poller**（gRPC 三连发：joint / eef / end_pose）
+- **ClosedLoopRunner**（2.5 Hz 推理 → 32 帧绝对动作 chunk）
+- **Dispatcher**（20 Hz 下发，4 帧线性混合）
+- **Watchdog**（10 ms 周期，异常进入 hold / emergency_stop）
 
-1. `POST /start`（可选携带 `instruction` 覆盖默认 prompt）触发闭环；
-2. `POST /stop` 或 `POST /emergency` 终止。
+HTTP 接口：
 
-`POST /infer` 保留并向后兼容（payload 缺字段则从内置缓存自取），用 `--enable-self-fetch=false` 可一键回退到旧的「客户端推数据」模式。
+1. `POST /start`（可选 `instruction`）触发闭环；
+2. `POST /stop` 或 `POST /emergency` 终止；
+3. `GET /health`、`GET /closed_loop_status`、`GET /ws_status` 观测。
 
-实测端到端闭环延迟约 **225 ms**（capture → 第一帧下发，图像传输 ~45 ms p50 + ARM RPC ~1 ms + 推理 ~170 ms p50 / 10 steps + 调度几 ms），控制环 20 Hz，推理环 2.5 Hz，chunk 内部用 4 帧（200 ms）线性混合做无缝拼接。
+`scripts/fastwam_http_server.py` 与本脚本完全独立，部署时按需起其中一个。
+
+实测端到端闭环延迟 **~225 ms**（capture → 第一帧下发；图像传输 ~45 ms p50 + ARM RPC ~1 ms + 推理 ~170 ms p50 / 10 steps）。控制环 20 Hz，推理环 2.5 Hz，chunk 内 4 帧（200 ms）线性混合做无缝拼接。
 
 ---
 
 ## 1. 设计目标
 
-- **接口最小化**：客户端不再承担图像 / 状态采集职责，只发触发信号；
+- **架构解耦**：旧 HTTP server 字节级不动，主动模式独立成新脚本；
+- **接口最小化**：客户端只发触发信号；
 - **延迟可控**：闭环 < 400 ms，控制频率 20 Hz、推理频率 2.5 Hz；
-- **失败安全**：WS 断流、ARM RPC 失败、推理超时、chunk 过期，任何一项都必须收敛到「机械臂可控的安全保持状态」或「急停」；
-- **向后兼容**：旧 `POST /infer` 路径保留，CLI flag 控制是否启用 self-fetch；
+- **失败安全**：WS 断流、ARM RPC 失败、推理超时、chunk 过期，任一收敛到「机械臂可控的安全保持」或「急停」；
 - **可观测**：每段延迟（图像准备 / 模型推理 / 下发调度）都有 `perf_counter` 打点 + 周期性日志；
 - **风险隔离**：所有新模块放在独立目录 `src/fastwam/server/`，删除该目录可整体回滚。
 
@@ -30,24 +43,22 @@
 
 ## 2. 架构图
 
-图中所有标签为纯 ASCII，等宽字体下严格对齐；中文说明放图外。
-
 ```text
                        +---------------------+
                        |    HTTP Client      |
                        +----------+----------+
                                   |
-              /start  /stop  /emergency  /status  /infer
+              /start  /stop  /emergency  /status  /health  /ws_status
                                   v
 +-----------------------------------------------------------------+
-| FastWAM HTTP Server  (single process)                           |
+| fastwam_active_loop_server.py  (single process, GPU=cuda:1)    |
 |                                                                 |
 |   +------------------+              +------------------+        |
 |   | WS Ingester      |              | ARM Poller       |        |
 |   | thread           |              | thread @ 50 Hz   |        |
 |   | - PyAV H.264     |              | - get_arm_joint  |        |
 |   | - auto reconnect |              | - get_eef_joint  |        |
-|   | latest_frame[k]  |              | - get_end_pose   |        |
+|   | frame_cache[k]   |              | - get_end_pose   |        |
 |   +--------+---------+              +---------+--------+        |
 |            |                                  |                 |
 |            v                                  v                 |
@@ -60,9 +71,11 @@
 |             +------------------------------+                    |
 |             | ClosedLoopRunner (infer thr) |                    |
 |             | 1. snapshot(frame,state,tcap)|                    |
-|             | 2. FastWAMModelClient.infer  |                    |
-|             | 3. denorm + delta_to_abs     |                    |
-|             | 4. write chunk_cache [32 x 7]|                    |
+|             | 2. undistort 1088x1280 raw   |                    |
+|             | 3. FastWAMModelClient.infer  |                    |
+|             | 4. _delta_to_absolute        |                    |
+|             | 5. push to chunk_ringbuffer  |                    |
+|             |    (keep newest 2, drop old) |                    |
 |             +--------------+---------------+                    |
 |                            |                                    |
 |                            v                                    |
@@ -82,8 +95,7 @@
 |             | - SDK fail streak   -> stop  |                    |
 |             | - WS stale > limit  -> stop  |                    |
 |             +--------------+---------------+                    |
-|                            |                                    |
-+----------------------------+------------------------------------+
++-----------------------------------------------------------------+
                              |
                              v
                  +---------------------------+
@@ -93,248 +105,386 @@
                  +---------------------------+
 ```
 
-说明：
-- `WS Ingester` 与 `ARM Poller` 并行运行，各自维护一个带 TTL 的 latest cache。
-- `ClosedLoopRunner` 是核心推理线程，按 2.5 Hz 触发：snapshot 两个 cache，跑 FastWAM，得到 `[32 x 7]` 绝对 action 写回 chunk_cache。
-- `Dispatcher` 是 20 Hz 定时器，决定每个 tick 该下发 chunk 的哪一帧（含丢陈旧 + 重叠混合 + rpy→quat 转换）。
-- `Watchdog` 监控三类异常并升级到急停或保持模式。
-
 ---
 
 ## 3. 数据流时序
 
-一次完整闭环的事件序列，`t=0` 是相机捕获时刻；每段标「实测」或「估算」。
+一次完整闭环的事件序列，`t=0` 是相机捕获时刻（=`head_left.stamp_ns`）；每段标「实测」或「估算」。
 
 ```text
 t=0       camera capture (head_left + right_wrist_left @ 20 Hz)
-t≈45      WS frame arrives in frame_cache         (real, p50; H.264 + LAN + PyAV)
-t≈47      ARM RPC triple returns to state_cache   (real, ~1 ms; runs every 20 ms)
-t≈50      ClosedLoopRunner snapshot(frame, state, t_capture = 0)
-t≈50..220 FastWAMModelClient.infer                (real, p50 167.5 ms @ 10 steps; Agent I)
-t≈225     chunk_cache write: 32 frames @ 50 ms
-          chunk[i] logical time = i * 50 ms  (chunk[0] = 0, chunk[31] = 1550)
+t≈85      bridge_send_ns (上游编码+打包) - 实测 ~85 ms
+t≈45-90   WS frame arrives in frame_cache       (实测 p50 45 ms p99 87 ms)
+t≈47      ARM RPC triple returns to state_cache (实测 ~1 ms; 50 Hz poller)
+t≈50      ClosedLoopRunner snapshot(frame, state, t_capture = head.stamp_ns)
+t≈50..220 FastWAMModelClient.infer (实测 p50 167.5 ms @ 10 steps; 含 undistort + stitch + resize + crop)
+t≈225     chunk_ringbuffer push: 32 frames @ 50 ms
+          chunk[i] logical time = base_capture_ts_ns + i * 50 ms
 
 t≈225     Dispatcher picks up new chunk
-          drop_n = ceil(225 / 50) = 5  (frames already in the past)
+          drop_n = ceil(225 / 50) = 5
 t≈225     send chunk[5],  blend w = 0.25
 t≈275     send chunk[6],  blend w = 0.50
 t≈325     send chunk[7],  blend w = 0.75
-t≈375     send chunk[8],  blend w = 1.00          (blend window ends)
-t≈425..   send chunk[9..31] without blending,
-          until next chunk lands at t ≈ 625..675 and takes over
+t≈375     send chunk[8],  blend w = 1.00  (blend window ends)
+t≈425..   send chunk[9..31] without blending
 
 (in parallel)
-t=400     next inference triggered (infer period = 400 ms)
+t=400     next inference triggered
 ```
 
 延迟分解：
 
 | 段 | 时长 | 来源 |
 | --- | --- | --- |
-| 摄像头 → frame_cache | 45–87 ms (p50–p99) | **实测**（Agent F：head 57.6 / wrist 44.5 mean） |
-| ARM gRPC 三连发 | 0.9–1.2 ms (p50–p99) | **实测**（Agent C） |
-| 图像预处理 (`_preprocess_image_batch`) | ~2.4 ms (p50) | **实测**（Agent I，长尾 max 104 ms 来自首次内存分配） |
-| `FastWAMModelClient.infer` @ 10 steps | 167.5–192.5 ms (p50–p99) | **实测**（Agent I，5090 GPU，含图像预处理；mean 168.9 ms / std 6.2 ms） |
+| 摄像头 → bridge_send_ns | ~85 ms | **实测**（probe meta JSON：`bridge_send_ns - stamp_ns`） |
+| bridge_send_ns → frame_cache | ~10 ms 量级 | LAN，单网段 0.15 ms ping，扣 jitter |
+| ARM gRPC 三连发 | 0.9–1.2 ms | **实测** |
+| undistort (1088×1280 双路) | 待实测 | OpenCV |
+| `_preprocess_image` (stitch + resize + crop + normalize) | 待实测（v1 估 ~2.4 ms 是 480×640 → 224×448；1088×1280 → 224×448 会略慢） | **新增项** |
+| `FastWAMModelClient.infer` @ 10 steps | 167.5–192.5 ms (p50–p99) | **实测**（5090 GPU，n=30，含 _preprocess_image） |
 | chunk_cache → dispatcher 接管 | ≤ 50 ms | 设计目标 |
 | `move_end_pose` + `move_eef` RPC | < 1 ms | 实测同 ARM 三连发 |
-| **总闭环（捕获 → 第一帧下发）** | **~225 ms** | 实测；比初版估算 350 ms 短 125 ms，预算余 ~175 ms |
+| **总闭环（捕获 → 第一帧下发）** | **~225 ms** | 实测 |
 
-**推理 scaling**（Agent I 拟合 `mean_ms = 12.95 * steps + 42.31`，R² = 0.9993）：
+WS 帧到达 jitter（**实测**）：
 
-| `num_inference_steps` | mean (ms) | 说明 |
-| ---: | ---: | --- |
-| 4 | 96.2 | 极快，需评估动作质量 |
-| 6 | 116.8 | 调优甜点 |
-| 8 | 146.3 | — |
-| **10** | **173.4** | **训练 eval 默认，当前推荐** |
-| 15 | 235.1 | 接近 400 ms 推理周期，无收益 |
-| 20 | 302.1 | 不建议 |
+```
+recv intervals (ms): [49.85, 85.70, 25.86, 39.87, 47.51, 49.99, 49.67]
+avg fps: 20.09  (target: 20 Hz)
+```
 
-单步 diffusion ~13 ms，固定开销 ~42 ms（VAE encode + text emb + denorm + py 调度）。如需进一步压延迟，调 `--num-inference-steps` 是最直接的杠杆。
+上游不严格 50 ms 周期，**单次抖动可达 ±35 ms**。`--ws-frame-max-age-ms` 默认 **250 ms**（原 v1 200 ms），避免误触发跳推理。
 
 ---
 
-## 4. CLI / 配置
+## 4. WS / ARM 探测结果（实测，2026-05-18）
 
-`scripts/fastwam_http_server.py` 新增 flag（保持旧 flag 不变）：
+### 4.1 WS 协议字段（完整 meta JSON）
+
+```json
+{
+  "bridge_send_ns": 1779098575753357660,
+  "channels": [
+    {
+      "data_size": 145769,
+      "format": "h264",
+      "frame_id": "camera_cam1_frame",
+      "name": "head_left",
+      "original_data_size": 145737,
+      "prepended_parameter_sets": true,
+      "stamp_ns": 1779098575668060470,
+      "topic": "rt/robot/camera/head/left/video_encoded"
+    },
+    {
+      "data_size": 163478,
+      "format": "h264",
+      "frame_id": "camera_cam5_frame",
+      "name": "right_wrist_left",
+      "original_data_size": 163446,
+      "prepended_parameter_sets": true,
+      "stamp_ns": 1779098575668889972,
+      "topic": "rt/robot/camera/right_wrist/left/video_encoded"
+    }
+  ],
+  "delta_ns": 829502,
+  "matched_by": "timestamp",
+  "pair_seq": 8469,
+  "payload_format": "h264_annexb_pair_v1",
+  "type": "encoded_sync_pair"
+}
+```
+
+字段约定：
+
+- **magic**：`b"RGBDWS4\x00"`（8 bytes）
+- **header**：`struct.unpack_from("<8sIII", msg, 0)` → `(magic, header_size, size_a, size_b)`（20 bytes）
+- **payload_format 必须等于** `"h264_annexb_pair_v1"`（启动自检）
+- **type 必须等于** `"encoded_sync_pair"`（启动自检）
+- **channel.name** 是 `"head_left"` / `"right_wrist_left"`，**与模型 `image_key` 同名**（identity 映射，**省略 `--ws-channel-map`**）
+- **channel.stamp_ns**：上游采集时刻；`base_capture_ts_ns = channels[head_left].stamp_ns`（**写死**）
+- **channel.prepended_parameter_sets = true**：每包自带 SPS/PPS，任意点接入即可解码
+- **delta_ns**：双通道 stamp 差，实测 0.83–0.95 ms（远小于 chunk dt 50 ms），head 锚点选取无歧义
+- **pair_seq**：单调递增，gap > 1 视为丢包，连续 30 帧 gap 异常 → 重连
+
+实测帧分辨率：**1088×1280×3 uint8**（H.264 解码后 bgr24）。
+
+### 4.2 ARM 实测
+
+```
+host=192.168.31.34 port=50051, 5 Hz × 3 s 采样
+
+joint angles_rad (起始零位):
+  j0..j5 = (0.0013, -0.0013, 0.0013, 1.5715, 0.0006, -1.5692)
+gripper_pos:  0.0887 - 0.0895  m   ← 单位 = 米 = state[6] = action[6]
+gripper_vel:  <0.01 m/s
+gripper_eff:  0
+end_pose.position_m  : x≈0.2867 y≈0.0004 z≈0.2150
+end_pose.orientation : (~0, 0, 0, 1) xyzw   ← 起始接近无旋转
+```
+
+`dataset_stats.json` 对齐：
+
+| 维 | dataset min / max | ARM 实测起始 |
+| --- | --- | --- |
+| state[0..5] (rad) | 详见 dataset_stats | 与零位一致 |
+| state[6] (gripper_m) | [0, 0.0904] | 0.0887 ✓ |
+| action[6] (gripper_m) | [0, 0.0904] | — |
+
+**确认**：`proprio_raw = [j0..j5(rad), eef_pos(m)]`（7 维），`current_position = [eef_xyz(m), eef_rpy(rad)]`（6 维，从 quat 转 rpy）。
+
+### 4.3 探测脚本位置
+
+- WS probe：`scripts/fastwam_ws_probe.py`（新增，本次提交）
+- ARM probe：参考脚本 `~/Desktop/read_arm_joint_angles.py`（用户提供，未入库）
+- 上游 WS bridge 源码：`/home/tb5z035i/robot/utils/rgbd_ws_bridge/`（5090_1 本地）
+- 上游 ai_client 参考脚本：`/home/tb5z035i/robot/utils/rgbd_ws_bridge/scripts/encoded_pair_ai_client.py`
+
+---
+
+## 5. CLI / 配置
+
+`scripts/fastwam_active_loop_server.py` 的 flag：
 
 | Flag | 默认值 | 含义 |
 | --- | --- | --- |
-| `--enable-self-fetch` | `false` | 总开关。`false` 走旧 client-push 路径，向后兼容 |
+| `--host` | `0.0.0.0` | HTTP 监听 host |
+| `--port` | `8118` | HTTP 监听 port（与旧 server 8117 错开） |
+| `--config` | `configs/task/real_1048_uncond_2cam224_1e-4.yaml` | model config |
+| `--checkpoint` | `runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/checkpoints/step_020000.pt` | ckpt |
+| `--dataset-stats` | `runs/.../dataset_stats.json` | normalizer stats |
+| `--text-cache-dir` | `data/text_embeds_cache/real_1048` | text emb cache |
+| `--default-camera-info` | `configs/camera_info/real_1048_default.json` | 双路相机标定，复用旧 server |
 | `--ws-url` | `ws://192.168.31.66:19095` | rgbd_ws_bridge 地址 |
-| `--ws-channel-map` | `head_left=<TBD>,right_wrist_left=<TBD>` | 上游通道名 → 模型 image_key 映射；通道名待 WS probe 确认 |
-| `--ws-frame-max-age-ms` | `200` | frame_cache 内单帧最大允许年龄，超过视为陈旧 |
+| `--ws-frame-max-age-ms` | `250` | frame_cache 单帧最大允许年龄（v1 200，v2 放宽以应对 ±35 ms recv jitter） |
 | `--ws-reconnect-backoff-ms` | `500,1000,2000,5000,10000` | 断线重连退避（逗号分隔，封顶最后一个值） |
+| `--ws-startup-timeout-ms` | `30000` | 启动时等首帧的最大时间，超时 abort |
+| `--ws-warn-stale-ms` | `200` | 单通道 last_frame_age 超过 → log WARNING |
+| `--ws-hold-stale-ms` | `500` | 单通道 last_frame_age 超过 → dispatcher 进入 hold |
+| `--ws-estop-stale-ms` | `1500` | 单通道 last_frame_age 超过 → emergency_stop |
 | `--arm-host` | `192.168.31.34` | arm_sdk gRPC host |
 | `--arm-port` | `50051` | arm_sdk gRPC port |
 | `--arm-poll-hz` | `50` | ARM 状态轮询频率 |
 | `--arm-state-max-age-ms` | `100` | state_cache 最大允许年龄 |
+| `--arm-lease-ms` | `15000` | acquire_control lease 时长（SDK 默认 15 s，内置自动续期） |
+| `--arm-acquire-on` | `start` | `start`（默认）= `/start` 时 acquire / `/stop` 时 release；`init` = server 启动时 acquire 直到进程退出 |
 | `--infer-period-ms` | `400` | 推理触发周期（2.5 Hz） |
 | `--send-period-ms` | `50` | 下发周期（20 Hz） |
 | `--blend-frames` | `4` | 新旧 chunk 重叠区帧数（线性混合） |
-| `--chunk-len` | `None`（auto） | 单次推理输出帧数。None 时从训练 config（`runs/.../config.yaml`）读 `data.train.num_frames - 1`（frame-aligned backward delta：第 0 帧 delta=0，可执行帧数 = num_frames - 1）。CLI 提供 override，但默认走 auto，避免与训练 horizon 漂移 |
-| `--train-config-path` | 从 ckpt 推导 | 训练 config yaml 路径；默认从 `--ckpt-path` 同级目录推导。用于读取 `num_frames` / `action_output_dim` / `context_len` / `eval_num_inference_steps` |
-| `--num-inference-steps` | `None`（auto） | 推理步数；None 时读训练 config 的 `eval_num_inference_steps`（当前训练 = 10） |
-| `--chunk-max-stale-ms` | `2000` | chunk 老于此值则进入安全保持模式 |
-| `--auto-dispatch` | `false` | `false` 时只跑推理 + 写日志，不调 SDK |
-| `--emergency-on-failure` | `true` | 失败时是否立刻触发 `set_arm_emergency_stop(True)` |
+| `--chunk-len` | `None`（auto） | 单次推理输出帧数。None 时从训练 config `data.train.num_frames - 1`（=32）推导 |
+| `--num-inference-steps` | `None`（auto） | 推理步数；None 时读训练 config `eval_num_inference_steps`（=10） |
+| `--chunk-max-stale-ms` | `2000` | chunk 老于此值 → 安全保持模式 |
+| `--auto-dispatch` | `false` | `false` 时只跑推理 + 日志，不调 SDK |
+| `--emergency-on-failure` | `true` | 失败时是否立刻 `set_arm_emergency_stop(True)` |
 | `--watchdog-period-ms` | `10` | watchdog 检查周期 |
-| `--instruction` | `"open the door"` | 默认 task；与现有 default fallback 共用 |
-| `--lease-renew-ms` | `4000` | lease 续期周期（SDK lease 5s，取 80%） |
-| `--ws-startup-timeout-ms` | `30000` | 启动时等首帧的最大时间，超时直接 abort |
-| `--ws-warn-stale-ms` | `200` | 单通道 last_frame_age 超过则 log WARNING（陈旧帧） |
-| `--ws-hold-stale-ms` | `500` | 单通道 last_frame_age 超过则 dispatcher 进入 hold mode |
-| `--ws-estop-stale-ms` | `1500` | 单通道 last_frame_age 超过则触发 emergency_stop |
+| `--instruction` | `"open the door"` | 默认 task；`/start` 可覆盖 |
+| `--device` | `cuda:1` | 默认 GPU（避开 5090_1 上 GPU 0 的 airdc 占用） |
+| `--require-gpu-mem-free-gb` | `8` | 启动检查 GPU 显存空闲下限，不足 → log ERROR + exit(1) |
+| `--undistort` | `true` | 是否对 1088×1280 输入做去畸变。设为 false 时跳过 undistort，原图直接给 model_clients（用于纯测试） |
+
+去掉的 v1 flag：
+
+- ~~`--enable-self-fetch`~~：新脚本默认就是 self-fetch 模式，旧 server 走另一条路
+- ~~`--ws-channel-map`~~：通道名与 image_key 同名，identity
+- ~~`--train-config-path`~~：从 `--checkpoint` 同级目录自动推导
+- ~~`--lease-renew-ms`~~：信任 SDK 内置续期
 
 ---
 
-## 5. 逐文件代码改动清单
+## 6. 图像流程（**关键变化**）
 
-> 本节只描述「将要怎么改」，不实际改任何代码。所有新文件均放在 `src/fastwam/server/` 目录下。
+**v2 决策**：服务端只做 undistort，**不再 cv2.resize 到 480×640**。所有 stitch+resize+crop+normalize 在 `FastWAMModelClient._preprocess_image` 内部完成。
 
-### 5.1 `src/fastwam/server/__init__.py`（新增）
-
-空 `__init__.py`，仅为打包目的。后续可暴露 `ArmClient` / `WSFrameIngester` / `ClosedLoopRunner` 顶层别名。
-
-### 5.2 `src/fastwam/server/rotation.py`（新增，工具函数）
-
-签名：
-
-```python
-def quat_xyzw_to_rpy(quat_xyzw: np.ndarray) -> np.ndarray   # shape (3,), float32
-def rpy_to_quat_xyzw(rpy: np.ndarray) -> np.ndarray         # shape (4,), float32
-def unwrap_rpy_sequence(rpy_seq: np.ndarray) -> np.ndarray  # shape (N,3)，处理 2π 跳变
-def quat_canonicalize(quat_xyzw: np.ndarray, ref: np.ndarray | None) -> np.ndarray
-    # 强制 w>=0 或与参考四元数同号，防止 SDK 帧间符号翻转
+```
+WS frame_cache (1088×1280×3 uint8 BGR, 两路)
+    ↓ ClosedLoopRunner.snapshot
+两路 BGR 1088×1280
+    ↓ undistort_stereo_side_from_camera_info(eye=left/right, output_size="native")
+    ↓ (跳过 cv2.resize 到 480×640)
+两路 BGR 1088×1280 (去畸变后)
+    ↓ FastWAMModelClient.infer(images=dict, ...)
+        内部:
+        ├── _stitch_cameras_native(horizontal): 1088 × 2560 × 3
+        ├── ResizeSmallestSideAspectPreserving(target 224×448):
+        │     scaling_ratio = max(448/2560, 224/1088) = max(0.175, 0.206) = 0.206
+        │     → 224 × 528 × 3
+        ├── CenterCrop(224, 448): 224 × 448 × 3
+        └── Normalize(mean=0.5, std=0.5) → tensor [C, 224, 448] in [-1, 1]
 ```
 
-约定（**与上游 mcap_preprocess_pipeline 一致**）：scipy `Rotation.from_quat(..).as_euler("xyz", degrees=False)`，extrinsic XYZ。
+**与训练侧（480×640 raw → stitch 480×1280 → resize 短边 480→224 → 224×597 → crop 224×448）的差异**：
+
+| 阶段 | 训练（lerobot raw 480×640） | v2 服务端（raw 1088×1280） |
+| --- | --- | --- |
+| stitch 后纵横比 | 480 : 1280 = 1 : 2.67 | 1088 : 2560 = 1 : 2.35 |
+| resize 后大小 | 224 × 597 | 224 × 528 |
+| center crop 留下的 W 中心区 | 224 × 448 of 597 → 留中心 75% | 224 × 448 of 528 → 留中心 85% |
+| 边缘视场 crop 量 | 25% | 15% |
+
+**结论**：v2 流程看到的图像视场**比训练时略宽**（边缘多保留 10%）。这是新引入的分布偏移项，**必须在上线前做一次 dry-test 验证**（见 §10）。如果效果差，回滚到 v1 写法（先 cv2.resize 到 480×640）只需要加一行 `cv2.resize(out[k], (640, 480), cv2.INTER_AREA)`。
+
+**保留训练流程的备用方案（feature flag）**：CLI 加 `--image-pipeline {raw_native, lerobot_480x640}`，默认 `raw_native`。如果上线 dry-test 发现偏差大，切到 `lerobot_480x640` 即恢复 v1 行为。
+
+---
+
+## 7. 逐文件代码改动清单
+
+> 所有新文件放在 `src/fastwam/server/` 目录。删除该目录 + 删除 `scripts/fastwam_active_loop_server.py` 即可整体回滚。
+
+### 7.1 `src/fastwam/server/__init__.py`（新增）
+
+空 `__init__.py`，仅为打包。
+
+### 7.2 `src/fastwam/server/rotation.py`（新增，工具函数）
+
+```python
+def quat_xyzw_to_rpy(quat_xyzw: np.ndarray) -> np.ndarray   # (3,) float32, extrinsic XYZ
+def rpy_to_quat_xyzw(rpy: np.ndarray) -> np.ndarray         # (4,) float32
+def unwrap_rpy_sequence(rpy_seq: np.ndarray) -> np.ndarray  # (N,3) 处理 2π 跳变
+def quat_canonicalize(q_new, q_prev) -> np.ndarray          # 同号化 (dot<0 取负)
+def unwrap_quat_sign(q_new, q_prev) -> np.ndarray           # alias of quat_canonicalize
+```
+
+约定：scipy `Rotation.from_quat(..).as_euler("xyz", degrees=False)`，extrinsic XYZ。
+
+**ground truth 防偏移机制**：靠 fingerprint 单测，不靠注释里的 commit hash。
+
+文件头注释只保留约定本身（便于后人快速 grep 到上游来源），不强制 verify hash：
+
+```python
+# rotation.py
+"""
+Euler convention: scipy Rotation.from_quat(..).as_euler("xyz", degrees=False), extrinsic XYZ.
+Must match training-side convention in
+  mcap_preprocess_pipeline/scripts/step01_extract_mcap_rgb_and_params.py:1117
+If the upstream changes convention, the fingerprint test below will fail.
+"""
+```
+
+fingerprint 单测才是真正的防线：
+
+- **GT 来源**：h200-1 `/DATA/disk1/datasets_lerobot/opendoor_real_1048` 数据集，随机抽 5 帧 action 的 `(quat_xyzw, expected_rpy)` 对，离线脚本 `scripts/fastwam_generate_rotation_fingerprint.py` 生成 `tests/fixtures/rotation_fingerprint.json`，commit 入库。
+- **运行**：`test_rotation_fingerprint.py` 加载 fixture，`assert max abs error < 1e-5`。
+- **启动时自动跑一次**，失败 → `sys.exit(1)`。
+- **失效机制**：如果上游改了约定 → 重训模型 → 重生成 dataset → 重生成 fingerprint fixture，单测自动随之 fail，迫使 rotation.py 同步更新。如果上游改了约定但 dataset 没重训，dataset 里 action 仍是老约定，FastWAM 也不受影响。
 
 单元测试要点：
 
-- 往返一致：`rpy_to_quat_xyzw(quat_xyzw_to_rpy(q)) ≈ ±q`（同号化后严格等于）；
-- 数值稳定：随机 N=1000 个旋转，最大相对误差 < 1e-6；
-- gimbal-lock 边界：pitch ∈ {±89.9°, ±90°, ±90.1°} 各跑一例，验证 rpy 是否仍可还原相同旋转；
-- 符号翻转：连续两帧四元数翻号时，`quat_canonicalize` 必须把第二帧改回参考符号。
+- 往返一致：`rpy_to_quat_xyzw(quat_xyzw_to_rpy(q)) ≈ ±q`（同号化后严格相等）；
+- N=1000 随机旋转，最大相对误差 < 1e-6；
+- gimbal-lock 边界：pitch ∈ {±89.9°, ±90°, ±90.1°} 各跑一例；
+- 符号翻转：连续两帧 quat 翻号，`unwrap_quat_sign` 必须修回参考符号。
 
-被调用方：`arm_client.py`（读 end_pose 时）、`closed_loop.py`（下发前 rpy→quat）。
-
-### 5.3 `src/fastwam/server/arm_client.py`（新增）
-
-类 `ArmClient`，封装 `airbot.AirbotClient`（arm_sdk 5.2.3，已装入 `.venv`）。
-
-构造参数：`host, port, poll_hz, state_max_age_ms, lease_renew_ms, logger`。
-
-主要方法：
+### 7.3 `src/fastwam/server/arm_client.py`（新增）
 
 ```python
 class ArmStateSnapshot(NamedTuple):
     angles_rad: np.ndarray       # (6,)
-    gripper_m: float
+    gripper_m: float             # 实际取自 client.get_eef_joint_state().eef_pos (米)
     eef_xyz: np.ndarray          # (3,)
-    eef_rpy: np.ndarray          # (3,)  extrinsic XYZ，已 unwrap + canonicalize
-    eef_quat_xyzw: np.ndarray    # (4,)  保留原始
-    capture_ts_ns: int
+    eef_rpy: np.ndarray          # (3,) extrinsic XYZ，已 unwrap + canonicalize
+    eef_quat_xyzw: np.ndarray    # (4,) 原始（未取负）
+    capture_ts_ns: int           # 本次 RPC 完成时刻（SDK 不返回采集时间戳）
 
 class ArmClient:
-    def __init__(self, ...): ...
-    def start(self) -> None: ...                       # 起后台 poller
+    def __init__(self, host, port, poll_hz, state_max_age_ms, lease_ms, logger): ...
+    def start(self) -> None: ...                # 起后台 poller 线程（只读 RPC，无需 lease）
     def stop(self) -> None: ...
-    def acquire_control(self) -> None: ...             # 包 acquire_control + switch_controller(servo)
+    def acquire_control(self) -> bool: ...      # 调 SDK acquire_control(lease_ms=lease_ms); SDK 内部自动续期
     def release_control(self) -> None: ...
-    def set_speeds(self, arm_rad_s: list[float], eef_m_s: float) -> None: ...
-    def latest(self) -> ArmStateSnapshot | None: ...   # state_cache 读
-    def send_pose(self,
-                  target_xyz: np.ndarray,
-                  target_rpy: np.ndarray,
-                  gripper_m: float | None) -> bool: ...
+    def latest(self) -> ArmStateSnapshot | None: ...
+    def send_pose(self, target_xyz, target_rpy, gripper_m) -> bool: ...
     def emergency_stop(self, enable: bool = True) -> None: ...
-    def health(self) -> dict: ...                      # for /health
+    def health(self) -> dict: ...               # 含 last_poll_age_ms, consecutive_fail, lease_alive
 ```
 
 行为细节：
 
-- 后台 poller 线程串行调用三个 RPC（实测约 1 ms），写入 `state_cache`。失败计数 `_consecutive_fail`，连续 N（默认 5）次失败则把 `health()` 标 RED。
-- `send_pose` 内部：`rpy → quat_xyzw → CartesianPose(position=(x,y,z), orientation=(qx,qy,qz,qw))`，调 `client.move_end_pose(pose, blocking=False)`；gripper 单独 `client.move_eef(g, options)`。两者均返回 bool，任一 False 时上抛 `ArmSdkError` 给 watchdog 决策。
-- lease 续期：单独 timer 每 `lease_renew_ms` 调用一次（SDK 提供哪个 API 待对照 `airbot_example_record_and_replay.py`，预留位置）。
-- `emergency_stop` 阻塞 0.15 s（SDK 已知行为），调用前后打日志。
+- **lease**：完全信任 `AirbotClient.acquire_control(lease_ms=15000, renew_period_s=5.0)` 的内置续期线程，**不外加 timer**。`health()` 读 SDK 内部 `_lease_id` / `_lease_expire_unix_ms` 暴露状态。
+- 后台 poller 串行三个 RPC（实测 ~1 ms），写 `state_cache`。失败计数 `_consecutive_fail`，连续 5 次 → `health()` 标 RED。
+- 每次写入 cache 前对 `eef_quat_xyzw` 做 `unwrap_quat_sign(new, last_quat)`，避免 ±q 翻号。
+- `send_pose`：`rpy → rpy_to_quat_xyzw → CartesianPose(position=(x,y,z), orientation=(qx,qy,qz,qw))` → `client.move_end_pose(pose, options=ArmControlOptions(), timeout_ms=1000)`；gripper 单独 `client.move_eef(g, options=ArmControlOptions(), timeout_ms=1000)`。`ArmControlOptions()` 默认 `blocking=False`。任一返回 False → 抛 `ArmSdkError`。
+- `emergency_stop` 阻塞 0.15 s（SDK 已知行为）。
 
-接口：被 `closed_loop.py` 构造、`fastwam_http_server.py` 在 `--enable-self-fetch=true` 时初始化。
+⚠️ **arm_sdk `set_arm_speed(arm_speed: list[float])` 只接受 6 个关节速度，没有独立 EEF 线速度 API**。v1 设计稿的 `set_speeds(arm_rad_s, eef_m_s)` 改为：
 
-### 5.4 `src/fastwam/server/ws_ingest.py`（新增）
+- **acquire 后**调一次 `set_arm_speed([π/6]*6)` 设置统一安全速度（每关节 30°/s）；
+- **hold 模式**：不重发命令，依靠 SDK 自然停在 last_pose；如发生超时，watchdog 触发 emergency_stop。
 
-类 `WSFrameIngester`，基于仓库外参考脚本 `encoded_pair_ai_client.py`。
-
-构造参数：`ws_url, channel_map: dict[str,str], frame_max_age_ms, reconnect_backoff_ms_list, logger`。
-
-主要方法：
+### 7.4 `src/fastwam/server/ws_ingest.py`（新增）
 
 ```python
 class FrameSnapshot(NamedTuple):
-    bgr: np.ndarray            # H×W×3 uint8
-    capture_ts_ns: int         # 由 V4 meta JSON 中的时间戳填，缺则用本地 ts
+    bgr: np.ndarray            # H×W×3 uint8 (1088×1280)
+    capture_ts_ns: int         # channel.meta['stamp_ns']
     decode_ts_ns: int
+    pair_seq: int
 
 class WSFrameIngester:
+    def __init__(self, ws_url, expected_channels, frame_max_age_ms, reconnect_backoff_ms_list, startup_timeout_ms, logger): ...
     def start(self) -> None: ...
     def stop(self) -> None: ...
     def latest(self, image_key: str) -> FrameSnapshot | None: ...
-    def health(self) -> dict: ...
+    def health(self) -> dict: ...     # last_frame_age_per_channel_ms, fps_5s, decode_fail_count, reconnect_count
 ```
 
-行为细节：
+实现要点：
 
-- 后台线程跑 `websocket-client` 同步循环（无 asyncio），收到 bytes 后按 V4 协议拆包：
-  1. 读 8 字节 magic，校验 `b"RGBDWS4\x00"`；
-  2. 读 `header_size:uint32`、`size_a:uint32`、`size_b:uint32`；
-  3. 读 `header_size` 字节解析 JSON meta（含 `channel_a`、`channel_b`、时间戳等）；
-  4. 读 `size_a` 字节 H.264 数据，喂入 PyAV codec context 解码 → BGR；
-  5. 同样处理 channel_b。
-- 解码失败（关键帧丢失等）跳过单帧，不报错。
-- 通道名 → image_key 映射通过 CLI `--ws-channel-map` 注入，例如：
-  ```
-  head_left=cam_head_left,right_wrist_left=cam_rwrist_left
-  ```
-  上游通道名以 WS probe 实测为准（**未解项**）。
-- 断线检测：socket 异常 / 心跳超时 → 关闭、按退避列表延迟重连；重连成功立刻请求关键帧（如协议支持）。
-- 内存：`latest_frame[image_key]` 用 `threading.Lock` + 一份 deep copy；解码缓冲池复用，避免每帧分配。
+1. 后台线程跑 `websocket-client` 同步循环（无 asyncio）。
+2. **代理 bypass**：启动时把 `ws_url` host 加进 `NO_PROXY`/`no_proxy`，并对 `WebSocketApp.run_forever` 传 `http_no_proxy=[host]`（参考 `encoded_pair_ai_client.py:76`）。
+3. 收到 bytes 后按 V4 协议拆包（见 §4.1）。
+4. 启动自检（5 秒内必须通过）：
+   - `payload_format == "h264_annexb_pair_v1"`
+   - `type == "encoded_sync_pair"`
+   - `len(channels) == 2` 且 `set(channel.name) == expected_channels`
+   - 任一不过 → 抛 `RuntimeError` 终止启动
+5. **PyAV 首包暖机**：probe 实测首包 codec context 输出空帧（pkt0 shape=None），pkt1+ 才正常。允许首 **2 个 packet** 解码失败；超过则报错。
+6. 启动 5 s 滑动窗口监测：fps、解码失败率、pair_seq 缺口；fps < 14 Hz（期望 70%）→ WARNING。
+7. **`base_capture_ts_ns = channels[head_left].stamp_ns`**（写死）。
+8. 每路 `latest_frame[image_key]` 用 `threading.Lock`；解码缓冲池复用。
 
-被调用方：`closed_loop.py` 推理前 `latest()` 取两路图像；`fastwam_http_server.py` `/health` 报告 ingester 健康。
+### 7.5 `src/fastwam/server/image_pipeline.py`（新增）
 
-#### 5.4.1 启动自检 + 运行期监控（应对 WS 上游不稳定）
-
-WSFrameIngester 启动时自检流程：
-
-1. 连接 `ws://<host>:19095`，`--ws-startup-timeout-ms`（默认 30 s）内未收到第一帧 → 抛 `RuntimeError` 终止启动；
-2. 收到首帧后校验：
-   - `codec == "h264_annexb_pair_v1"`（payload_format）；
-   - shape ∈ {(1088, 1280, 3), (480, 640, 3)}；
-   - channel.meta['name'] 在 `expected_channels`（默认 `head_left`、`right_wrist_left`）；
-   - 任一校验失败 → 抛 `RuntimeError` 并打印实际值，引导用户检查 `--ws-channel-map`；
-3. 启动后 5 秒滑动窗口监测：fps、解码失败率、pair_seq 缺口；
-   - fps < 期望 70%（e.g. < 14 Hz 当期望 20 Hz）→ log WARNING；
-   - 解码失败 / pair_seq 跳跃 → log WARNING + 计数。
-
-运行期监控：
-
-- WSFrameIngester 暴露：`last_frame_age_per_channel_ms`、`fps_5s`、`decode_fail_count`、`reconnect_count`；
-- Watchdog 每 100 ms 检查 `last_frame_age_per_channel_ms`：
-  - `> --ws-warn-stale-ms`（200 ms）：log WARNING（陈旧帧）；
-  - `> --ws-hold-stale-ms`（500 ms）：进入 hold mode（暂停下发）；
-  - `> --ws-estop-stale-ms`（1500 ms）：触发 `emergency_stop`；
-- `GET /health` 暴露所有上述指标；
-- `GET /ws_status` 单独端点返回 ingester 详细状态（每通道最近 N 次解码耗时、key frame 间隔、最近一次重连原因）。
-
-### 5.5 `src/fastwam/server/closed_loop.py`（新增）
-
-核心调度类 `ClosedLoopRunner`。
-
-构造参数：`model_client, arm_client, ws_ingester, channel_map, train_config_path, infer_period_ms, send_period_ms, chunk_len, num_inference_steps, blend_frames, chunk_max_stale_ms, auto_dispatch, emergency_on_failure, watchdog_period_ms, logger`。
-
-构造时强制校验（**不一致直接 abort，不允许 fall back**）：
+把 `scripts/fastwam_http_server.py:_normalize_image_resolution` 抽出来供两边复用：
 
 ```python
-# 在 __init__ 内
+def undistort_native(
+    images: dict[str, np.ndarray],   # 1088×1280×3 uint8 BGR
+    default_camera_info: dict[str, dict],
+    stereo_pair: dict[str, str],     # {"left": "head_left", "right": "right_wrist_left"}
+    alpha: float = 0.0,
+) -> dict[str, np.ndarray]:
+    """与旧 server 一致的 undistort 逻辑，但不做 cv2.resize 到 480×640。
+    返回的 BGR 仍是 1088×1280×3 uint8。"""
+```
+
+旧 `scripts/fastwam_http_server.py` 内部 `_normalize_image_resolution` 拆出 helper 后保持原行为不变（向后兼容）。
+
+### 7.6 `src/fastwam/server/closed_loop.py`（新增）
+
+```python
+@dataclass
+class ChunkEntry:
+    action_abs: np.ndarray         # (chunk_len, 7) — xyz, rpy, gripper
+    base_capture_ts_ns: int        # = head_left.stamp_ns at snapshot
+    step_dt_ns: int = 50_000_000
+    chunk_id: int
+
+class ClosedLoopRunner:
+    def __init__(self, model_client, arm_client, ws_ingester, train_config_path,
+                 infer_period_ms, send_period_ms, chunk_len, num_inference_steps,
+                 blend_frames, chunk_max_stale_ms, auto_dispatch,
+                 emergency_on_failure, watchdog_period_ms,
+                 default_camera_info, stereo_pair, logger): ...
+    def start(self, instruction: str | None) -> None: ...
+    def stop(self) -> None: ...
+    def emergency(self) -> None: ...
+    def status(self) -> dict: ...
+```
+
+构造时强制校验（不一致直接 abort）：
+
+```python
 train_cfg = yaml.safe_load(open(self.train_config_path))
 cfg_num_frames        = train_cfg["data"]["train"]["num_frames"]            # 33
 cfg_action_dim        = train_cfg["data"]["train"]["processor"]["action_output_dim"]  # 7
@@ -345,384 +495,351 @@ expected_chunk_len    = cfg_num_frames - 1                                   # 3
 if self.chunk_len is None:
     self.chunk_len = expected_chunk_len
 elif self.chunk_len != expected_chunk_len:
-    raise RuntimeError(
-        f"chunk_len mismatch: CLI={self.chunk_len} vs train_config num_frames-1={expected_chunk_len}"
-    )
-
-# 与 FastWAMModelClient.action_horizon 二次校验
+    raise RuntimeError(...)
 if self.chunk_len != self.model_client.action_horizon:
-    raise RuntimeError(
-        f"chunk_len({self.chunk_len}) != model_client.action_horizon({self.model_client.action_horizon})"
-    )
-
-# action_output_dim 必须等于 7（xyz + rpy + gripper）
-assert cfg_action_dim == 7, f"unexpected action_output_dim={cfg_action_dim}"
-
-# num_inference_steps fallback 到训练 eval 配置
+    raise RuntimeError(...)
+assert cfg_action_dim == 7
 if self.num_inference_steps is None:
     self.num_inference_steps = cfg_eval_steps
 ```
 
-> 训练 config 当前值（`runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/config.yaml`，已从 h200-1 拷贝到 5090_1 并 md5 验证一致）：
-> - `data.train.num_frames: 33` → 可执行 chunk_len = 32
-> - `data.train.processor.action_output_dim: 7`
-> - `data.train.context_len: 128`
-> - `eval_num_inference_steps: 10`
+**三条线程**：
 
-主要状态：
+#### 7.6.1 InferLoop（2.5 Hz）
+
+1. 每 `infer_period_ms` 触发，用 `time.monotonic()` 漂移补偿；
+2. **snapshot**：从 `ws_ingester.latest("head_left")` / `latest("right_wrist_left")` 取两帧、`arm_client.latest()` 取 state；
+3. **校验**：任一图像 / state 老于阈值则跳过本次推理，记 `skip_reason`；
+4. **undistort**：调 `image_pipeline.undistort_native(images, default_camera_info, stereo_pair)`，保持 1088×1280 输出；
+5. **组装 model input**：
+   ```python
+   model_input = {
+       "images": {"head_left": ndarray, "right_wrist_left": ndarray},
+       "proprio_raw": np.concatenate([state.angles_rad, [state.gripper_m]]),
+       "current_position": np.concatenate([state.eef_xyz, state.eef_rpy]),
+       "instruction": current_instruction,
+   }
+   ```
+6. **调推理**：`result = self.model_client.infer(model_input)`（**v1 设计稿误写为 `predict_action`，实际方法名是 `infer`**）；
+7. `result["actions"]` 已经是 cartesian_absolute (32, 7)；
+8. **写 chunk_ringbuffer**：双缓冲 ringbuffer，容量 **2**。**push 新 chunk 时丢最旧的**（决策见 §10 风险 8）；
+9. 整段 `perf_counter` 打点：`image_prep / model / postproc` 三段。
+
+#### 7.6.2 DispatchLoop（20 Hz，50 ms timer，`time.monotonic_ns()` 漂移补偿）
+
+1. 取当前最新的 chunk（ringbuffer 末尾），以及上一条（混合用，可能为 None）；
+2. 计算 `idx = round((t_slot - chunk.base_capture_ts_ns) / chunk.step_dt_ns)`；
+3. `idx < 0` 跳过（理论不出现）；`idx >= chunk_len` → chunk 耗尽，进入 hold（不发新命令，依赖 SDK 自然停在 last_pose）；
+4. 若 prev_chunk 存在且 `idx_in_blend = (now - new.base) / dt < blend_frames`：
+   - `idx_old = (t_slot - prev.base) / dt`
+   - `idx_new = (t_slot - new.base) / dt`
+   - `w = (idx_in_blend + 1) / blend_frames`，即 0.25 → 1.0
+   - **xyz** 线性混合
+   - **rpy**：先对 `[prev.rpy[idx_old], new.rpy[idx_new]]` 做联合 `unwrap_rpy_sequence`，再 lerp；任一维差 > π/4 → 放弃混合，硬切（log WARNING）
+   - **gripper** 线性混合
+5. `arm_client.send_pose(xyz, rpy, gripper)`；
+6. send 失败 → `emergency_on_failure` 决定急停 / hold。
+
+#### 7.6.3 Watchdog（100 Hz，10 ms 周期）
+
+- `chunk_age = now - chunk.base_capture_ts_ns - chunk_len * dt`，> `chunk_max_stale_ms` 且 ringbuffer 无更新 chunk → hold；
+- `arm_client.health() / ws_ingester.health()` 连续 RED > 200 ms → emergency_stop；
+- InferLoop 心跳：上次结束 > 2× `infer_period_ms` → WARN；> 5× → hold；
+- WS stale 三档：warn / hold / estop（CLI flag）。
+
+`status()` 报告：`current_chunk_id`、`prev_chunk_id`、`last_dispatch_idx`、`blend_state`、`hold_mode`、各 health 灯、最近 N 次推理耗时直方图。
+
+### 7.7 `scripts/fastwam_active_loop_server.py`（新增）
+
+入口结构：
 
 ```python
-@dataclass
-class ChunkEntry:
-    action_abs: np.ndarray         # (chunk_len, 7) — xyz, rpy, gripper（已 cumsum 反积分）
-    base_capture_ts_ns: int        # 推理输入观测的时间戳锚点
-    step_dt_ns: int = 50_000_000
-    chunk_id: int
-
-class ClosedLoopRunner:
-    def __init__(self, ...): ...
-    def start(self) -> None: ...
-    def stop(self) -> None: ...
-    def emergency(self) -> None: ...
-    def status(self) -> dict: ...
+def main():
+    args = build_argparser().parse_args()
+    # 1. 启动日志 banner (见 §7.7.1)
+    # 2. GPU 显存检查
+    check_gpu_free_mem(args.device, args.require_gpu_mem_free_gb)
+    # 3. 加载 model_client (复用 FastWAMModelClient)
+    model = init_model(args)
+    # 4. rotation fingerprint
+    run_rotation_fingerprint_or_exit(args)
+    # 5. ARM 启动 poller（不 acquire）
+    arm = ArmClient(...); arm.start()
+    # 6. WS ingester 启动 + 启动自检
+    ws = WSFrameIngester(...); ws.start()
+    # 7. ClosedLoopRunner（不 start，等 /start）
+    runner = ClosedLoopRunner(model, arm, ws, ...)
+    # 8. HTTP server
+    httpd = ThreadingHTTPServer((host, port), make_handler(arm, ws, runner))
+    # 9. warmup + benchmark 推理 N 次
+    warmup_benchmark_or_exit(model)
+    # 10. serve_forever
 ```
 
-三条线程：
+HTTP endpoints（仅这些，无 `/infer`）：
 
-1. **InferLoop**（threading.Timer 模式或精确 `time.monotonic` 调度）：
-   - 每 `infer_period_ms` 触发一次；
-   - snapshot：从 `ws_ingester.latest()` 取所有 image_key，从 `arm_client.latest()` 取 ArmStateSnapshot；
-   - 校验：任一图像 / state 老于阈值则跳过本次推理，记录 `skip_reason`；
-   - 组装 model input：`images` dict、`proprio_raw = concat(angles_rad, [gripper_m])`、`current_position = concat(eef_xyz, eef_rpy)`；
-   - 调 `FastWAMModelClient.predict_action(...)`（**复用**现 `scripts/fastwam_http_server.py` 内已有的 model 封装，不复制逻辑）；
-   - 调 `_delta_to_absolute(denorm_action, current_position)` 反积分 →（chunk_len, 7）绝对动作；
-   - 构造 `ChunkEntry`，写到 `chunk_cache`（双缓冲：current + next）；
-   - 整段用 `perf_counter` 打 image_prep / model / postproc 三段时间。
+- `POST /start`：body `{"instruction": "open the door"}`（可选）。流程：`arm.acquire_control()` → `runner.start(instruction)`
+- `POST /stop`：`runner.stop()` → `arm.release_control()`
+- `POST /emergency`：body `{"enable": true|false}`（默认 true）。调 `arm.emergency_stop(enable)`，急停后必须再 POST `{"enable": false}` 复位才能 `/start`
+- `GET /health`：基础状态 + arm.health() + ws.health()
+- `GET /closed_loop_status`：runner.status()
+- `GET /ws_status`：ws.health() 详版（每通道近 N 次解码耗时、key frame 间隔、最近一次重连原因）
 
-2. **DispatchLoop**（精确 50 ms timer，使用 `time.monotonic_ns()` 漂移补偿）：
-   - 每槽 `t_slot`，计算应该播哪一帧：`idx = round((t_slot - chunk.base_capture_ts_ns) / chunk.step_dt_ns)`；
-   - 若 `idx < 0` 跳过（chunk 比当前时刻还新，理论不会出现）；
-   - 若 `idx >= chunk_len` 标记 chunk 耗尽 → 进入安全保持（保留最后一帧位姿，gripper 不变，速度 0）；
-   - 若已有 next_chunk 且 idx 落在新旧重叠区前 `blend_frames` 帧内：
-     - 老 chunk 在 `idx_old = (t_slot - old.base)/dt`；
-     - 新 chunk 在 `idx_new = (t_slot - new.base)/dt`；
-     - 权重 `w = (idx_in_blend + 1) / blend_frames`（0.25→1.0）；
-     - 在 **xyz 空间** 线性混合（毫无问题）；
-     - 在 **rpy 空间** 线性混合（**讨论**：因为训练侧 delta 也是 rpy 分量减法 + cumsum，rpy 累计值是连续的——前提是没有 ±π 跳变，所以小窗口（200 ms）内直接 lerp 是合理的；为防 unwrap 失败，混合前先 `unwrap_rpy_sequence` 对两条 rpy 序列做联合 unwrap，再 lerp）；
-     - gripper 线性混合；
-   - 调 `arm_client.send_pose(xyz, rpy, gripper)`；
-   - send 失败 → `emergency_on_failure` 决定急停或 hold。
-
-3. **Watchdog**（默认 10 ms 周期）：
-   - 检查 chunk_age = now - chunk.base_capture_ts_ns - chunk_len * dt；若 > `chunk_max_stale_ms`，**且** 没有 next_chunk → 进入 hold 模式（DispatchLoop 改播 last_pose，速度 0）；
-   - 检查 `arm_client.health()` / `ws_ingester.health()`：连续 RED 超过 200 ms → 紧急停止；
-   - 检查 InferLoop 心跳：上次推理结束至今 > 2 × infer_period_ms → 记 WARN；> 5 × → 进入 hold。
-
-`status()` 报告：current_chunk_id、next_chunk_id、last_dispatch_idx、blend_state、hold_mode、各健康灯、最近 N 次推理耗时直方图。
-
-### 5.6 `scripts/fastwam_http_server.py`（修改）
-
-**保留原 527 行所有逻辑**，仅做最小增量：
-
-- 顶部 `argparse` 新增 5.4 节所有 flag（默认值如上）；
-- `main()`：
-  - 旧 `model = FastWAMModelClient(...)` 初始化保持不变；
-  - 若 `--enable-self-fetch=true`：
-    - 构造 `arm_client = ArmClient(host, port, ...)`、`ws_ingester = WSFrameIngester(...)`；
-    - 启动两者（poller + ws ingester 线程）；
-    - 构造 `runner = ClosedLoopRunner(model_client=model, ...)`；
-    - 把 `runner / arm_client / ws_ingester` 挂到 HTTPServer 实例属性，供 handler 读；
-- handler 新增 endpoint：
-  - `POST /start`：body `{"instruction": "open the door"}`（可选）；调 `runner.start(instruction=...)`；
-  - `POST /stop`：`runner.stop()`；
-  - `POST /emergency`：`runner.emergency()`；
-  - `GET /closed_loop_status`：返回 `runner.status()`；
-- `POST /infer` 行为：
-  - 若 `--enable-self-fetch=false` → 原行为不变；
-  - 若 `true` → payload 中 `images / proprio_raw / current_position` 缺失时，从 ingester / arm_client 自取（与现有 `instruction` / `undistort` fallback 同一风格）；
-- `GET /health`：原报告基础上追加 `arm_client.health()` 和 `ws_ingester.health()` 子字段；
-- `_perform_infer`（旧函数）整段加 `perf_counter` 打点：image_decode / model_forward / postproc，写到响应 `timings` 字段（旧客户端可忽略）；
-- `_INFER_LOCK` 保留——self-fetch 模式下 InferLoop 也走它，跟旧 `/infer` 互斥（避免两条入口同时打模型）。
-
-#### 5.6.1 server 启动日志（INFO 级，**强制打印**）
-
-启动 banner 必须包含以下字段，便于运维一眼核对配置/版本一致性：
+#### 7.7.1 启动日志 banner（INFO 级，**强制打印**）
 
 ```
-[startup] train_config_path = runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/config.yaml
-[startup] train.num_frames  = 33
-[startup] chunk_len          = 32        (= num_frames - 1, frame-aligned backward delta)
-[startup] action_output_dim  = 7         (xyz + rpy + gripper)
-[startup] context_len        = 128
-[startup] num_inference_steps= 10        (from eval_num_inference_steps)
-[startup] ws_url             = ws://192.168.31.66:19095
-[startup] ws_channel_map     = head_left=cam_head_left, right_wrist_left=cam_rwrist_left
-[startup] arm_host:port      = 192.168.31.34:50051
-[startup] infer_period_ms    = 400       (2.5 Hz)
-[startup] send_period_ms     = 50        (20 Hz)
-[startup] blend_frames       = 4
-[startup] scipy_version      = <pinned>  (rotation 约定 API 行为依赖)
-[startup] rotation fingerprint test: PASS
+[startup] script               = fastwam_active_loop_server.py v2
+[startup] train_config_path    = runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/config.yaml
+[startup] train.num_frames     = 33
+[startup] chunk_len            = 32        (= num_frames - 1, frame-aligned backward delta)
+[startup] action_output_dim    = 7         (xyz + rpy + gripper)
+[startup] context_len          = 128
+[startup] num_inference_steps  = 10        (from eval_num_inference_steps)
+[startup] device               = cuda:1
+[startup] gpu_free_mem_gb      = NN.N      (require ≥ 8)
+[startup] ws_url               = ws://192.168.31.66:19095
+[startup] ws_channels          = head_left, right_wrist_left  (identity mapping)
+[startup] arm_host:port        = 192.168.31.34:50051
+[startup] arm_lease_ms         = 15000     (SDK auto-renew @ 5s)
+[startup] infer_period_ms      = 400       (2.5 Hz)
+[startup] send_period_ms       = 50        (20 Hz)
+[startup] blend_frames         = 4
+[startup] image_pipeline       = raw_native (1088x1280 -> undistort -> model_clients)
+[startup] scipy_version        = <pinned>
+[startup] rotation fingerprint test (5 GT samples from opendoor_real_1048): PASS
 [startup] warmup infer (5 calls) ... last latency = NNN ms
 [startup] benchmark infer (10 calls): p50=NNNms p95=NNNms p99=NNNms
 ```
 
-如果训练 config 与 CLI override 不一致、或 fingerprint 单测失败、或 benchmark p50 > 500 ms（见 8 节风险 8）→ 直接 `sys.exit(1)`。
+启动失败硬条件（任一不过 → `sys.exit(1)`）：
 
-### 5.7 `docs/fastwam_http_server.md`（修改）
+- 训练 config 与 CLI override 不一致
+- fingerprint 单测失败
+- GPU 显存 free < `--require-gpu-mem-free-gb`
+- benchmark p50 > 500 ms
+- WS 启动自检不过（payload_format / type / channels 不符合）
+- WS 首帧超时（30 s）
 
-新增章节：
-- self-fetch 模式开关与各 CLI flag；
-- 启动两种典型命令行（兼容模式 / self-fetch 模式）；
-- `/start /stop /emergency /closed_loop_status` 端点说明；
-- 向后兼容声明：`--enable-self-fetch=false` 时行为与历史版本字节级一致；
-- 运行手册：切换 instruction 时需先跑 `scripts/precompute_text_embeds.py` 生成 text cache，否则 500。
+### 7.8 `scripts/fastwam_http_server.py`（**不动**）
+
+v1 设计稿要求修改此文件。**v2 完全不动**，保持现有行为：客户端推 images + proprio + current_position，被动调用。仅在 §7.5 提到 `_normalize_image_resolution` 拆出 helper 时做无行为变化的重构。
+
+### 7.9 `scripts/fastwam_ws_probe.py`（新增，本次提交）
+
+把 §4 中跑过的 probe 脚本固化入库，供后续上线核验 / 故障排查。
+
+### 7.10 `scripts/fastwam_generate_rotation_fingerprint.py`（新增）
+
+离线脚本：从 h200-1 `/DATA/disk1/datasets_lerobot/opendoor_real_1048` 读 5 个随机 frame 的 cartesian action，dump 成 `tests/fixtures/rotation_fingerprint.json`。
+
+### 7.11 `docs/fastwam_http_server.md`（修改）
+
+新增 "Active Loop Server" 章节，说明：
+
+- 两个 server 的关系（旧的被动 / 新的主动，端口不同 8117 / 8118）
+- `/start /stop /emergency /closed_loop_status` 端点
+- 运行手册：切换 instruction 需先跑 `precompute_text_embeds.py`
+- 上线 checklist（坐标系零位测试、GPU 选择、上游 WS bridge 启动顺序）
+
+### 7.12 `pyproject.toml` / `uv.lock`（修改）
+
+加依赖：
+
+```
+av >= 16.0.1
+websocket-client >= 1.9.0
+```
+
+5090_1 `.venv` 已有这两个，pin 当前实测版本（av 16.0.1 / websocket-client 1.9.0）。
 
 ---
 
-## 6. 错误处理 / 安全策略
+## 8. 错误处理 / 安全策略
 
 | 事件 | 触发条件 | 响应 |
 | --- | --- | --- |
 | WS 单帧解码失败 | PyAV throw | 跳过该帧，计数 +1，连续 30 帧失败 → 关闭重连 |
 | WS 断流 | socket 断 / 心跳超时（默认 1 s） | 进入退避重连；断流 > 1 s 且闭环运行中 → DispatchLoop 进入 hold；> 5 s → 急停 |
-| ARM RPC 单次失败 | `move_*` 返回 False 或 RPC 抛异常 | 立即 hold；若 `emergency_on_failure=true` 立刻急停 |
-| ARM RPC 连续失败 N=5 | poller / dispatcher 共用计数 | 急停 + 标记 health RED + 拒绝 `POST /start` |
-| 推理异常 | model.predict_action throw | 当前 chunk 继续耗尽；若耗尽时仍无新 chunk → hold |
+| ARM RPC 单次失败 | `move_*` 返回 False / RPC 抛异常 | 立即 hold；若 `emergency_on_failure=true` 立刻急停 |
+| ARM RPC 连续失败 N=5 | poller / dispatcher 共用计数 | 急停 + health RED + 拒绝 `/start` |
+| 推理异常 | model.infer throw | 当前 chunk 继续耗尽；耗尽时仍无新 chunk → hold |
 | 推理超时 | 单次 > 2 × infer_period_ms | WARN；> 5 × → hold；连续 3 次 → 急停 |
-| chunk 跑完无新 chunk | dispatch idx >= chunk_len 且 next_chunk 缺 | hold（位姿保持，重发 last_pose，gripper 不变） |
-| lease 被抢 | acquire_control 失败 / 后续 RPC 报无权限 | 急停（机械臂仍在前一条命令上）+ /health RED + 拒绝 /start |
-| `set_arm_emergency_stop` 调用 | watchdog 决策 | 阻塞 0.15 s，记录原因 + 状态；后续 `/start` 必须先调 `/emergency` 复位 |
-| watchdog 反应窗口 | 10 ms 周期 + ≤ 1 ms RPC + 150 ms 急停阻塞 | 最坏约 165 ms 从异常出现到机械臂收到急停 |
-| 主进程崩溃 | Python 未捕获异常 | 终止前 try-finally 中调一次 emergency_stop；systemd / supervisor 重启策略由部署侧决定 |
+| chunk 跑完无新 chunk | dispatch idx >= chunk_len 且 ringbuffer 空 | hold（不发新命令，SDK 自然停） |
+| lease 被抢 | SDK 内部 `_lease_id` 清空 | 急停 + health RED + 拒绝 `/start`（手动 `/emergency` `{"enable": false}` + 重启进程） |
+| `set_arm_emergency_stop` 调用 | watchdog 决策 | 阻塞 0.15 s，记录原因；后续 `/start` 必须先 POST `/emergency {"enable": false}` 复位 |
+| watchdog 反应窗口 | 10 ms + ≤ 1 ms RPC + 150 ms 急停阻塞 | 最坏约 165 ms |
+| 主进程崩溃 | Python 未捕获异常 | try-finally 内调一次 emergency_stop；systemd/supervisor 重启策略由部署侧决定 |
 
 ---
 
-## 7. 测试计划
+## 9. 测试计划
 
 - **单元测试**（pytest）：
-  - `rotation.py`：往返一致 / unwrap / canonicalize / gimbal-lock 边界；
-  - `ws_ingest.py`：喂一条固定字节流（事先 dump V4 包）→ 验证解析 + 解码后图像 hash；
-  - `closed_loop.py`：`ChunkBuffer` 重叠混合的数学正确性（构造两条已知 chunk，验证混合后的轨迹严格等于 0.25→1.0 lerp）；
-  - `arm_client.py`：用 mock gRPC stub 验证 `send_pose` 转换链路（rpy→quat→CartesianPose 字段顺序）。
+  - `rotation.py`：fingerprint（从 opendoor_real_1048 抽取的 5 GT）+ 往返一致 + unwrap + gimbal-lock 边界；
+  - `ws_ingest.py`：喂事先 dump 好的 V4 字节流 → 验证解析 + 解码后图像 hash；
+  - `closed_loop.py`：`ChunkEntry` ringbuffer + blend 数学正确性；
+  - `arm_client.py`：mock gRPC stub 验证 `send_pose` 转换链路（rpy→quat→CartesianPose 字段顺序）。
 - **集成测试**（不连真硬件）：
   - mock WS server（asyncio）回放预录二进制流；
   - mock arm_sdk（grpc 服务端 stub）回放 angle / pose；
   - 端到端跑 60 s `--auto-dispatch=false`，验证调度时序日志：每槽间隔标准差 < 2 ms。
 - **dry-run**（连真 SDK 但不动机械臂）：
   - `--auto-dispatch=false`，机械臂围栏内但断电；
-  - 跑 60 s，看 chunk_cache 写入频率、混合区帧索引、watchdog 心跳；
+  - 跑 60 s，看 chunk_ringbuffer 写入频率、混合区帧索引、watchdog 心跳；
+- **零位 dry-test（坐标系一致性，**绕过模型**）**：
+  - 不启动 `runner.start()`，单独写一个测试 endpoint `POST /debug/zero_pose_test`；
+  - 流程：读 `arm.latest()` → `current_pose = (eef_xyz, eef_rpy)` → 伪造 `actions = repeat(concat(current_pose, gripper_m), 32)` → 直接构造 `ChunkEntry` 喂 dispatcher；
+  - 跑 5 s，机械臂应**完全不动**。任何位姿漂移 = 坐标系错配，立刻 abort + 修代码。
 - **上线测试**（最后一步）：
   - `--auto-dispatch=true`，安全工位，单次开门；
-  - 第一次启动先做 **零位 dry-test**：`current_position` 读出来，cumsum 32 帧全 0 delta，下发，验证机械臂确实不动（确认坐标系一致）。
+  - 先做 §9 零位 dry-test 确认坐标系，再跑真实任务。
 
 ---
 
-## 8. 风险分析
-
-> 这一节是核心。每条按「现象 / 原因 / 影响等级 / 缓解 / 回滚」给。
+## 10. 风险分析
 
 ### 风险 1 — 欧拉约定 ground truth 在仓库外
-- **现象**：训练侧用 `scipy.Rotation.from_quat(..).as_euler("xyz")` 在 `mcap_preprocess_pipeline/scripts/step01_extract_mcap_rgb_and_params.py:1117`。FastWAM 仓库不依赖它，无 import 关系。
-- **原因**：约定靠口头/文档同步。一旦上游改成 "XYZ"（大写 intrinsic）或 "zyx"，FastWAM 这边推断出的 rpy 会跟训练数据语义不一致，反积分后位姿大幅偏差。
-- **影响**：高。
+- **现象**：训练侧用 `scipy.Rotation.from_quat(..).as_euler("xyz")` 在 `mcap_preprocess_pipeline/scripts/step01_extract_mcap_rgb_and_params.py:1117`。
+- **影响**：高。一旦上游改了约定，反积分后位姿大幅偏差。
 - **缓解**：
-  1. 在 `src/fastwam/server/rotation.py` 模块文件头**注释**记录三件事：
-     - ground truth 上游路径：`/data/home/Lyle/Projects/mcap_preprocess_pipeline/scripts/step01_extract_mcap_rgb_and_params.py:1117`；
-     - 关键代码片段：`Rotation.from_quat(quat).as_euler("xyz", degrees=False)`；
-     - 上游 commit hash（**部署时**ssh 到 `mcap_preprocess_pipeline` 仓库 `git rev-parse HEAD` 填进来）。
-  2. 在 rotation.py 同目录加 `test_rotation_fingerprint.py` 单测：
-     - 含 3–5 组 `(quat_xyzw, expected_rpy)` ground truth，从 dataset action 反算出来的真实采样点；
-     - `assert max abs error < 1e-5`；
-     - server 启动时自动 run 一次，失败 abort（见 5.6.1）。
-  3. 在 README / CLAUDE.md 写一行 reminder：「如果 `mcap_preprocess_pipeline` 改了欧拉约定，需要同步更新 FastWAM 的 `rotation.py` 并重生成 fingerprint 单测的 ground truth。」
-  4. 启动日志打印 fingerprint 校验通过 + `scipy.__version__`（约定 API 行为依赖 scipy）。
-- **回滚**：发现不一致时立刻 `--auto-dispatch=false` + 修 `rotation.py` 中的 convention 字符串 + 重新生成 fingerprint。
+  1. `rotation.py` 文件头注释记录上游路径 + 关键片段（不要求填 commit hash，因为静态字符串不会自动更新，靠 fingerprint 单测兜底）；
+  2. `test_rotation_fingerprint.py` 单测 5 组 GT（从 opendoor_real_1048 抽），`max abs error < 1e-5`；
+  3. server 启动自动跑一次，失败 abort；
+  4. 启动日志打印 fingerprint 通过 + `scipy.__version__`。
+- **回滚**：发现不一致 → `--auto-dispatch=false` + 修 convention + 重生成 fingerprint。
 
 ### 风险 2 — SDK 帧间四元数符号翻转
-- **现象**：`get_end_pose` 返回 `(qx,qy,qz,qw)` 与 `(-qx,-qy,-qz,-qw)` 表示同一姿态，但 `as_euler` 算出的 rpy 在 ±π 边界会跳 2π。
-- **原因**：很多 IK / 滤波内部用最短路径选符号，但 SDK 不保证。
-- **影响**：高。任何 rpy 跳变都会被 cumsum 放大成爆炸级偏差。
-- **缓解（必须实现，否则会爆 cumsum）**：
-  1. 在 `src/fastwam/server/rotation.py` 提供：
-     ```python
-     def unwrap_quat_sign(q_new: np.ndarray, q_prev: np.ndarray) -> np.ndarray:
-         """同一旋转 q 和 -q 等价；为了保证连续帧 quat 不跳变，
-         若 dot(q_new, q_prev) < 0 则取 -q_new。"""
-         return q_new if np.dot(q_new, q_prev) >= 0 else -q_new
-     ```
-  2. 在 `ArmClient.ArmPoller` 维护 `last_quat`：
-     - 第一次：直接保存；
-     - 后续：`unwrap_quat_sign(new, last_quat)` → 写入 `state_cache` 之前修正；
-     - 同时检测：unwrap 触发频率 > 1 Hz 视为异常，log WARNING（SDK 可能在 NaN/边界值附近反复翻转）。
-  3. 写入 rpy 之前再叠一层 `unwrap_rpy_sequence`（rpy 域 unwrap）做兜底——双层防御。
-- **测试**：
-  - rotation 单测加 `unwrap_quat_sign` 双向往返：q 和 -q 都喂进来，输出应等价（同号）；
-  - ArmPoller 测试：mock 一个故意翻转符号的 quat 序列，验证 unwrap 后无 2π 跳变。
-- **回滚**：发现跳变时 watchdog 立即急停；离线修 `unwrap_quat_sign` / `unwrap_rpy_sequence` 逻辑。
+- **现象**：`get_end_pose` 可能返回 `q` 或 `-q`（同一姿态），cumsum 放大成爆炸级偏差。
+- **影响**：高。
+- **缓解**：`rotation.unwrap_quat_sign(new, last)` + ArmPoller 维护 `last_quat`；写入 rpy 前再叠一层 `unwrap_rpy_sequence` 兜底。
+- **回滚**：watchdog 检测 rpy 帧间跳变 > π/2 → 急停。
 
 ### 风险 3 — Gimbal lock
-- **现象**：当 pitch ≈ ±90°，roll / yaw 解不唯一，`as_euler` 返回的 rpy 数值会不连续。
-- **原因**：欧拉角固有数学奇点。
-- **影响**：中。「open the door」任务通常 pitch 不会逼近 ±90°，但右手腕摄像头视角下 pitch 可能接近 ±60°，要看实际工位。
-- **缓解（分层）**：
-
-  **A) 检测层（必做）**：
-   在 Dispatcher 每帧检查 `rpy[1]` (pitch)：
-   - `|pitch| > 75°` (~1.31 rad)：log WARNING("approaching gimbal lock")；
-   - `|pitch| > 85°` (~1.48 rad)：log ERROR + 进入 hold mode。
-
-  **B) 不连续跳变检测（必做）**：
-   连续两帧 rpy 任一维度变化 > π/4 视为异常：
-   - log WARNING；
-   - 该帧不下发（hold 上一帧目标），等下一次推理或下一帧 chunk；
-   - 连续 3 帧异常 → `emergency_stop`。
-
-  **C) 任务先验（必做）**：
-   open-the-door 任务 EEF 朝向基本水平，理论上不会接近 pitch = ±90°；
-   如果上线后 WARNING 频繁触发，说明：
-   1. dataset 坐标系定义跟 SDK 不同；或
-   2. SDK 返回的 quat 已经在 gimbal 区。
-   两种情况都需要排查标定，**不能简单调阈值**。
-
-  **D) 终极缓解（如 A/B 不够，再考虑实现，本期不实施）**：
-   在 chunk 接近 gimbal 区域时切到四元数 slerp delta，
-   但这会破坏跟训练侧的 cumsum 等价性，**仅作 future work，本期明确不实现**。
-
-- **回滚**：watchdog 检测到 rpy 帧间跳变 > π/2 → 急停（实质就是 B 的兜底）。
+- **现象**：pitch ≈ ±90° 时 rpy 不连续。
+- **影响**：中。open-the-door 一般不接近。
+- **缓解**（分层）：
+  - A. Dispatcher 每帧检查 `|pitch|`：> 75° WARN，> 85° ERROR + hold；
+  - B. 连续两帧 rpy 任一维差 > π/4 视为异常，跳本帧；连续 3 帧异常 → emergency_stop；
+  - C. 任务先验：open-the-door EEF 朝向基本水平；若 WARN 频繁触发，先排查标定，**不能简单调阈值**；
+  - D. （future work）chunk 接近 gimbal 区切到 slerp delta，本期不实施。
 
 ### 风险 4 — WS 推流帧率波动
-- **现象**：上游 rgbd_ws_bridge 实际推流不严格等间隔，偶尔 100 ms+ 空隙。
-- **原因**：H.264 关键帧周期、上游编码器抖动、网络抖动。
-- **影响**：中。模型输入用陈旧帧 → 动作滞后。
-- **缓解**：`frame_max_age_ms=200` 卡控；InferLoop 内若图像 > 阈值，跳过本次推理（chunk 继续耗尽，hold 兜底）。
+- **现象**：probe 实测 recv jitter ±35 ms。
+- **影响**：中。
+- **缓解**：`frame_max_age_ms=250`（v2 放宽）；InferLoop 内若图像 > 阈值跳本次推理。
 - **回滚**：调大 max_age 或调小推理频率。
 
 ### 风险 5 — chunk 时间戳锚点漂移
-- **现象**：DispatchLoop 用 `base_capture_ts_ns + idx*50ms` 对齐时间，若 `base` 取错（用 server local time 而不是图像 capture ts），不同 chunk 间会出现「时间跳跃」。
-- **原因**：实现混淆「推理时刻」「图像采集时刻」「下发时刻」。
-- **影响**：高。混合区会出现非物理跳变。
-- **缓解**：**强制规定** `chunk.base_capture_ts_ns = image.capture_ts_ns`（不是 ARM state，不是 server now），并在代码里做 invariant 检查。日志里同时打三个时间戳便于核对。
-- **回滚**：发现漂移时切到「不混合，硬切换」模式做对照。
+- **现象**：若 base 取错（server now 而非 head_left.stamp_ns），混合区出现非物理跳变。
+- **影响**：高。
+- **缓解**：**强制 `chunk.base_capture_ts_ns = head_left.stamp_ns`**（invariant 检查 + 日志同时打三个时间戳：head.stamp_ns / server now / dispatch ts）。
+- **回滚**：发现漂移切到「不混合，硬切换」模式。
 
-### 风险 6 — delta_rpy 是分量差而非物理 delta（**核心讨论点**）
-- **现象**：训练数据 `delta_rpy[t] = rpy[t] - rpy[t-1]`，不是 `R_{t-1}^{-1} @ R_t`。Server 现 `_delta_to_absolute` 用 `cumsum` 反积分，跟训练侧严格一致 → 不要改。
-- **混合区问题**：因为 rpy 是「分量累加」语义而不是真物理欧拉，重叠区在 rpy 空间做 lerp 也是「同语义内的线性混合」，理论上没问题。但**前提**是两条 chunk 的 rpy 在混合窗口内没有 ±π 跳变。
+### 风险 6 — delta_rpy 是分量差而非物理 delta
+- **现象**：训练数据 `delta_rpy[t] = rpy[t] - rpy[t-1]`，server 现 `_delta_to_absolute` 用 cumsum 严格一致 → 不要改。
+- **混合**：rpy 是"分量累加"语义，重叠区 lerp 合理，前提是无 ±π 跳变 → 混合前联合 unwrap，任一维差 > π/4 放弃混合。
 - **影响**：中。
-- **缓解**：(a) 混合前对 [old_chunk.rpy, new_chunk.rpy] 做联合 unwrap（统一参考帧）；(b) 给两条 rpy 序列限制最大跳变 π/4，超过则放弃混合，硬切；(c) 在 `closed_loop.py` 内加单测：手工构造两条带 -π 跳变的序列，验证 unwrap+lerp 仍连续。
-- **回滚**：`--blend-frames=0` 关闭混合。
+- **回滚**：`--blend-frames=0`。
 
-### 风险 7 — lease 续期失败
-- **现象**：arm_sdk lease 默认 5 s，server 内部定时器若续期失败（network / SDK 异常），后续 RPC 会被拒。
-- **原因**：lease 续期超时 / SDK 内部状态异常。**注意**：本风险仅讨论「同一个 server 进程内的 lease 续期问题」，不涉及多 HTTP 客户端 / 多 controller 抢占（FastWAM 部署模型是单 server 单 controller，多 HTTP 客户端竞争 `/start` 不在本设计范围内）。
-- **影响**：高。机械臂仍在执行 server 的前一条命令，但 server 已失控。
-- **缓解**：(a) lease 续期定时器，周期 `--lease-renew-ms`（默认 4000，即 lease 5 s 的 80%）；(b) 单次续期失败立即重试一次，仍失败则进入 hold；连续 2 次失败 → 急停；(c) RPC 失败（move_end_pose / move_eef 返回 False 或抛权限异常）立刻急停；(d) `acquire_control` 启动时调用一次，不做 retry。
+### 风险 7 — lease 续期失败（v2 简化）
+- **现象**：arm_sdk lease 默认 15 s，SDK 自带后台续期；若 SDK 自身故障 / 网络断 → 续期失败。
+- **影响**：高。
+- **缓解**：(a) **完全信任 SDK 内置续期**，不外加 timer；(b) `arm.health()` 每 100 ms 检查 SDK 内部 `_lease_id` 是否为 None，None > 200 ms → emergency_stop；(c) RPC 返回 "control lease cleared" 类错误立刻急停。
 - **回滚**：手动急停 + 重启 server。
 
 ### 风险 8 — 模型推理时延（已实测，仍需运行期监控）
-- **现象**：实测 `FastWAMModelClient.infer @ 10 steps` 在 5090 GPU 上 p50 167.5 ms / p99 192.5 ms（Agent I，n=30，含图像预处理）。但**实测是在 GPU 空闲 + 同卡独占**条件下取得；运行期若 GPU 被其它进程抢占（5090_1 上 GPU 0 已被 `airdc` 占 95%，**本服务必须用 GPU 1**）或显存碎片化，时延可能跳到 250+ ms。
-- **原因**：单步 diffusion ~13 ms + 固定 ~42 ms（线性拟合 R²=0.9993），10 步 ~173 ms 是设计点。`num_inference_steps` 是最敏感的杠杆。
-- **影响**：中。当前预算 400 ms 推理周期下余 ~230 ms，余量充足；但若 > infer_period_ms (400 ms)，链路会反复 hold。
+- **现象**：5090 GPU 实测 p50 167.5 / p99 192.5 ms @ 10 steps（n=30）。
+- **影响**：中。预算 400 ms 余 ~230 ms。
 - **缓解**：
-  1. **启动 warmup + benchmark**：server 启动时 warmup 5 次 + 实测 10 次推理耗时（用 dummy 输入），把 p50/p95/p99 写入启动日志（见 5.6.1）；
-  2. **强制使用 GPU 1**：CLI 默认 `CUDA_VISIBLE_DEVICES=1`（或 `--device cuda:1` 直接指定），避开 5090_1 上 GPU 0 的常驻 airdc 进程；启动时检查显存 < 80% 占用，否则 WARN；
-  3. **`/infer` 打点**：在 handler 加 `time.perf_counter` 打点（每次 ≤ 5 字段：`preprocess / infer / denorm / format / total`），用 `logger.info`；
-  4. **启动日志告警阈值**：
-     - p50 > 220 ms（实测 + 30% margin）：log WARNING，提示 GPU 可能被抢占或 num_inference_steps 设高了；
-     - p50 > 350 ms：log WARNING + 建议降 `--num-inference-steps`（10 → 6 可省 ~50 ms，到 ~117 ms）；
-     - p50 > 500 ms：log ERROR 并 `sys.exit(1)`，建议检查 ckpt / GPU 状态；
-  5. **运行期监控**：单次推理 > `2 × infer_period_ms` (800 ms) → WARN，> 5× (2000 ms) → 进入 hold；连续 3 次超 `infer_period_ms` → emergency_stop；
-  6. **调优空间**（备用）：`num_inference_steps=6` 时 mean 116.8 ms，端到端可降到 ~175 ms。若上线后发现 quality 仍足够，可视情况下调。
-- **回滚**：调大 `--infer-period-ms`，降低 `--num-inference-steps`，或减小 chunk_len（需重训）。
+  1. 启动 warmup + benchmark，p50/p95/p99 写入启动日志；
+  2. **强制 `--device cuda:1`**，避开 GPU 0 上 airdc；启动检查显存 free < `--require-gpu-mem-free-gb` 直接 exit；
+  3. `infer` 内 `perf_counter` 打 `preprocess / infer / denorm / format / total`；
+  4. 启动告警阈值：p50 > 220 WARN，> 350 WARN + 提示降 steps，> 500 ERROR + exit；
+  5. 运行期：单次 > 2× `infer_period_ms` WARN，> 5× hold；连续 3 次超 `infer_period_ms` emergency_stop；
+  6. 调优空间：`num_inference_steps=6` mean 116.8 ms，端到端可降到 ~175 ms（quality 待验）。
 
 ### 风险 9 — 坐标系一致性（world vs base）
-- **现象**：训练时的 6D pose 是哪个坐标系（机器人 base？world？相机？）暂未在本仓库文档中明确；SDK `get_end_pose` 返回的是哪个坐标系也需核。
-- **原因**：训练数据 pipeline 在外部仓库，转换链路长。
-- **影响**：高。坐标系错配 = 直接漂飞。
-- **缓解**：(a) 上线前做「读 pose → cumsum 0 delta 32 帧 → 下发」零位测试；(b) 若 0 delta 下机械臂不动，可以认为坐标系一致；(c) 文档加坐标系核验 checklist。
-- **回滚**：发现错配 → `--auto-dispatch=false` 退场。
+- **现象**：训练 6D pose 是哪个坐标系 / SDK `get_end_pose` 是哪个坐标系，文档未明。
+- **影响**：高。
+- **缓解**：(a) §9 **零位 dry-test 必跑**（绕过模型，伪造 actions = repeat(current_pose, 32)）；(b) 任何位姿漂移 = 坐标系错配，立刻 abort。
+- **回滚**：`--auto-dispatch=false` 退场。
 
 ### 风险 10 — 急停反应窗口
-- **现象**：watchdog 10 ms 周期 + RPC 约 1 ms + `set_arm_emergency_stop` 阻塞 0.15 s，最坏约 165 ms 才生效。同时 dispatch 还在以 50 ms 一发下命令。
-- **原因**：watchdog 与 dispatcher 异步。
-- **影响**：中。
-- **缓解**：(a) watchdog 触发急停前先把 dispatcher 的 `auto_dispatch` 标志置 False（同步原子操作），dispatcher 下一槽不再发；(b) 急停期间忽略所有 send 失败的「重试」逻辑；(c) `set_arm_emergency_stop` 阻塞期间 InferLoop 也暂停。
-- **回滚**：物理按钮兜底（部署侧职责）。
+- **现象**：watchdog 10 ms + RPC ~1 ms + 急停阻塞 150 ms ≈ 165 ms 最坏。
+- **缓解**：watchdog 触发急停前先把 dispatcher `auto_dispatch` 标志原子置 False；急停期间忽略所有 send 重试；急停阻塞期间 InferLoop 也暂停。
+- **回滚**：物理按钮兜底（部署侧）。
 
-### 风险 11 — WS 上游 RGBD 节点不稳定
-- **现象**：上游 rgbd_ws_bridge 历史上经常无数据，需要手动重启上游服务；运行中也可能突然卡顿、丢帧、fps 抖动到期望值的 50% 以下。
-- **原因**：上游 rgbd_ws_bridge 本身的健壮性问题，FastWAM 不负责修复，只能在客户端做防御。
-- **影响**：高。WS 是闭环的关键输入，长时间陈旧帧 → 模型生成滞后动作 → 实际位姿偏离目标。
-- **缓解**（详细策略见 5.4.1 节）：
-  1. **启动自检**：30 s 内未收到首帧 → abort；首帧 codec / shape / channel 名校验不过 → abort；
-  2. **5 s 滑动窗口监测**：fps < 期望 70% / 解码失败 / pair_seq 跳跃 → log WARNING；
-  3. **运行期 watchdog**（每 100 ms 检查 `last_frame_age_per_channel_ms`）：
-     - `> --ws-warn-stale-ms`（200 ms）：log WARNING；
-     - `> --ws-hold-stale-ms`（500 ms）：dispatcher 进入 hold mode（暂停下发）；
-     - `> --ws-estop-stale-ms`（1500 ms）：触发 `emergency_stop`；
-  4. **指标暴露**：`/health` + `/ws_status` 报告 `last_frame_age_per_channel_ms / fps_5s / decode_fail_count / reconnect_count`；
-  5. **退避重连**：socket 异常 / 心跳超时按 `--ws-reconnect-backoff-ms` 退避列表重连，重连成功后请求关键帧。
-- **回滚**：手动 `--enable-self-fetch=false`，退回客户端推图模式；同时排查 / 重启上游 rgbd_ws_bridge。
+### 风险 11 — WS 上游不稳定
+- **现象**：rgbd_ws_bridge 历史上经常无数据；本次开发期间也复现过 `Connection refused`（需手动启动）。
+- **影响**：高。
+- **缓解**（详见 §7.4）：
+  1. 启动 30 s 内无首帧 → abort；首帧 payload_format/type/channel 校验不过 → abort；
+  2. 5 s 滑动窗口监测 fps / 解码失败 / pair_seq 跳跃；
+  3. 运行期 watchdog 三档：warn 200 ms / hold 500 ms / estop 1500 ms；
+  4. `/health` + `/ws_status` 暴露 `last_frame_age_per_channel_ms / fps_5s / decode_fail_count / reconnect_count`；
+  5. 退避重连 + 重连后请求关键帧（如协议支持）。
+- **回滚**：停服 + 手动排查 / 重启上游 rgbd_ws_bridge。
 
-### 风险 12 — chunk 跑完保持模式 vs SDK 命令队列
-- **现象**：SDK `move_end_pose(..., blocking=False)` 返回后命令是否真已执行完成？hold 模式下重发 last_pose 是否会与 SDK 内部仍未完成的旧命令冲突？
-- **原因**：SDK 内部命令队列行为不完全透明。
-- **影响**：中。
-- **缓解**：(a) hold 时把 arm_speed 设为非常小（如 π/12 rad/s），让 SDK 自然停在 last_pose；(b) 不主动重发 last_pose，而是「不发新命令」配合小速度；(c) 上线前在 dry-run 测一次 hold 行为。
-- **回滚**：hold = `set_arm_emergency_stop(True)` 直接急停（更激进但安全）。
+### 风险 12 — chunk_ringbuffer 容量与丢弃策略（v2 新增明确）
+- **决策**：ringbuffer 容量 = 2。push 新 chunk 时，若 buffer 已满，**丢最旧**（FIFO 满则覆盖头）。
+- **原因**：infer_period 400 ms + chunk_len * dt = 1600 ms，第 3 次推理结果到达时第 1 个 chunk 大概率已被 dispatcher 跑完（dispatch 走完 1600 ms 需要 32 帧）。但若推理偶尔变慢导致 dispatch 提前耗尽，丢最旧能保证总是用最新观测。
+- **影响**：低（运行期推理稳定时三块从不堆积，buffer 永远只占 1-2 个）。
+- **可观测**：`status()` 暴露 ringbuffer occupancy 历史最大值。
 
-### 风险 13 — `mixtures.*` namespace 加载兼容性
-- **现象**：默认 ckpt `runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/checkpoints/step_020000.pt` 已确认为新 namespace 格式，且 step_015000 已通过验证。
-- **原因**：历史上 ckpt key prefix 变更过。
-- **影响**：低（已 mitigated）。
-- **缓解**：保持现 `FastWAMModelClient` 加载链路不变；本次改造不动模型加载。
-- **回滚**：N/A。
+### 风险 13 — SDK 命令队列与 50 ms 下发周期
+- **现象**：`move_end_pose(pose, options=ArmControlOptions(), timeout_ms=1000)` 内部默认 `blocking=False`，是否会在 SDK 内部排队？hold 模式与未完成旧命令冲突？
+- **缓解**：(a) acquire 后 `set_arm_speed([π/6]*6)`（30°/s）让命令在合理时间内执行完；(b) hold 模式**不主动重发** last_pose，依赖小速度自然停；(c) PR6 dry-run 时统计 `move_end_pose` RPC return 时间分布，若 p99 飙升说明 SDK 内部排队，需要降下发频率。
+- **回滚**：hold = `set_arm_emergency_stop(True)`（更激进但安全）。
 
 ### 风险 14 — text cache 仅 1 个 entry
-- **现象**：当前 text cache 只有 hash `243062ca...` 一个 entry，对应 `"open the door"`。切换 instruction 会 500。
-- **原因**：text encoder 离线预计算，按 prompt hash 落盘。
-- **影响**：中（运营层面）。
-- **缓解**：(a) `/start` 若收到未 cache 的 instruction，server 返回 4xx 明确错误，提示「先跑 precompute_text_embeds.py」；(b) 文档 + 部署 README 列清楚；(c) 后续考虑 server 启动时自动 precompute（独立 PR，不在本次范围）。
+- **现象**：text cache 只有 `"open the door"` 一条。
+- **缓解**：`/start` 收到未 cache instruction → 返回 4xx 明确错误"先跑 precompute_text_embeds.py"；上线 README 写清。
 - **回滚**：限定 instruction 列表，运维白名单。
 
-### 风险 15 — `output_action_format = cartesian_absolute` vs `action_mode = delta6_abs_gripper`
-- **现象**：模型输出是「delta6 + abs_gripper」，反积分后是「cartesian_absolute」。两个字段含义易混淆，可能在某处 transform 误用。
-- **原因**：命名历史遗留。
-- **影响**：中。
-- **缓解**：(a) 改造时不动现有 `_delta_to_absolute` 逻辑，仅在其外加一层 `send_pose` 适配（rpy→quat）；(b) 单元测试覆盖反积分 + 转换链路；(c) 注释里写清两个字段语义。
-- **回滚**：N/A（逻辑不动）。
+### 风险 15 — 图像 pipeline 与训练分布偏移（**v2 新增**）
+- **现象**：v2 服务端不再 cv2.resize 到 480×640，模型看到的图像 stitch 后纵横比 1:2.35（训练 1:2.67），center crop 后边缘视场多保留 ~10%。
+- **影响**：高。新引入的分布偏移，可能影响动作质量。
+- **缓解**：
+  1. 上线前在静态画面上跑 5–10 次推理，对比 v1 流程（先 480×640）和 v2 流程（直接 1088×1280）输出 action 的 max abs diff；
+  2. CLI 加 `--image-pipeline {raw_native, lerobot_480x640}`，默认 `raw_native`；
+  3. dry-test 中观察 chunk action 是否合理（不爆炸、不抖动）；
+  4. **若发现偏差大**，CLI 切到 `lerobot_480x640` 即可一键恢复 v1 行为。
+- **回滚**：`--image-pipeline=lerobot_480x640`。
 
 ---
 
-## 9. 回滚策略
+## 11. 回滚策略
 
-- **L1（最轻）**：`--auto-dispatch=false`。Server 仍跑推理 + 打日志，但不下发命令。任何疑问优先切到这一档观察。
-- **L2**：`--enable-self-fetch=false`。完全退回旧 client-push 模式，行为与历史版本字节级一致。
-- **L3（最重）**：删除 `src/fastwam/server/` 目录 + 还原 `scripts/fastwam_http_server.py` 即恢复到改造前。所有新代码隔离在独立目录，无侵入。
-- **CLI 默认值**：首次上线 `--enable-self-fetch=false` + `--auto-dispatch=false`。验证稳定后逐档放开。
-
----
-
-## 10. 开发顺序建议（PR 拆分）
-
-按风险递增：
-
-1. **PR1 — perf_counter 打点**：仅在现 `scripts/fastwam_http_server.py` 加 timing 字段，零风险，立刻可上。
-2. **PR2 — rotation 工具 + 单测**：纯函数，零运行时影响。
-3. **PR3 — ArmClient（poller + state cache，不 dispatch）**：只读 RPC，无副作用。挂到 `/health` 做观察。
-4. **PR4 — WSFrameIngester 骨架**：只 latest()，不接 InferLoop。挂到 `/health` 报告。
-5. **PR5 — `/infer` fallback 用 ingester/arm_client**：仍由 client 触发，但缺字段自取。先在内部测试桩上验证。
-6. **PR6 — ClosedLoopRunner（dry-run）**：`--auto-dispatch=false`，跑推理 + 写 chunk_cache + 计算应播帧，仅日志。
-7. **PR7 — dispatch 接入**：开 `--auto-dispatch=true`，加 watchdog；先单帧测试再连续。
-8. **PR8 — 急停联调 + 上线运行手册**：完整覆盖 6 节所有错误事件。
+- **L0（运行期最轻）**：`--auto-dispatch=false`，server 仍跑推理 + 打日志，不下发命令；
+- **L1**：`--image-pipeline=lerobot_480x640`，恢复 v1 一致的图像 pipeline；
+- **L2**：停 `fastwam_active_loop_server.py`，启 `fastwam_http_server.py`，回到被动模式（旧 server 完全没动）；
+- **L3（最重）**：删除 `src/fastwam/server/` + `scripts/fastwam_active_loop_server.py` 即恢复改造前。所有新代码隔离在独立目录/文件。
+- **CLI 默认值**：首次上线 `--auto-dispatch=false`。验证稳定后再开。
 
 ---
 
-## 11. 未解项
+## 12. 开发顺序建议（PR 拆分）
 
-- **WS 实测通道名**：另一个 agent 正在跑 ws probe，未回写。`--ws-channel-map` 默认值待确认。
-- **模型推理时延实测**：需要 PR1 落地 + server 启动 benchmark 跑一次 calibration（见风险 8），再回填 3 节延迟分解表。
-- **坐标系一致性（world vs base）**：上线前必须做零位测试（读 pose → cumsum 0 delta 32 帧 → 下发，机械臂应不动）。
-- **gimbal lock 实际触发概率**：要在 open-the-door 任务真实工位下采集 pitch 分布（运行期 dispatcher 已有 detection，见风险 3）。
-- **SDK lease 续期 API 具体名称**：需对照 `airbot_example_record_and_replay.py` 确认；先在 `ArmClient` 预留 timer 槽位。
-- **mcap_preprocess_pipeline commit hash**：rotation.py 文件头注释里需要填上游欧拉约定来源的 commit hash，首次部署时通过 ssh 取（见风险 1）。
+| PR | 内容 | 风险 | 依赖 |
+| --- | --- | --- | --- |
+| PR1 | `rotation.py` + 单测 + fingerprint 生成脚本 | 零 | 纯函数 |
+| PR2 | `image_pipeline.undistort_native` 抽取，旧 server 重构无行为变化 | 低 | — |
+| PR3 | `ws_ingest.py` 骨架 + `scripts/fastwam_ws_probe.py` 入库 | 低 | PR2 |
+| PR4 | `arm_client.py`（只读 poller，不 acquire） | 低 | — |
+| PR5 | `closed_loop.py` + `fastwam_active_loop_server.py` 骨架，`--auto-dispatch=false`，跑推理 + 写 chunk_ringbuffer + 日志 | 中 | PR1–4 |
+| PR6 | dispatch 接入，`--auto-dispatch=true`，加 watchdog；先零位 dry-test 再单帧测试 | 高 | PR5 |
+| PR7 | 急停联调 + 上线运行手册 + `docs/fastwam_http_server.md` 更新 | 高 | PR6 |
+
+---
+
+## 13. 未解项（v2）
+
+v1 的"WS 实测通道名 / WS 协议字段 / SDK lease API / gripper 单位"**已在 §4 实测落地**。
+
+剩余：
+
+- **坐标系一致性**：上线前 §9 零位 dry-test 必跑；如果失败再决定坐标系转换矩阵。
+- **图像 pipeline 分布偏移实测对比**：上线前对比 raw_native vs lerobot_480x640 输出差（见风险 15）。
+- **gimbal lock 实际触发概率**：dispatcher 上线后采集 pitch 分布，回填风险 3 阈值。
+- **undistort 实际耗时**：1088×1280 双路 undistort 时延需要 PR3 落地后实测，回填 §3 表。
+- **SDK 命令队列行为**：PR6 dry-run 时统计 `move_end_pose` p99 RPC return 时间，确认 SDK 是否内部排队。

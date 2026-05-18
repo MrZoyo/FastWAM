@@ -363,3 +363,214 @@ percentiles. Any of the following abort the launch with `exit(1)`:
   `scripts/fastwam_active_loop_server.py`. All new code lives in
   isolated paths so a single revert restores the pre-PR state.
 - Malformed requests return HTTP 400, including non-7D `proprio_raw` and missing camera keys.
+
+## v2 CLI Reference
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--host` | `0.0.0.0` | HTTP bind host |
+| `--port` | `8118` | HTTP bind port (v1 server uses 8117) |
+| `--config` | `configs/task/real_1048_uncond_2cam224_1e-4.yaml` | Model config |
+| `--checkpoint` | `runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/checkpoints/step_020000.pt` | Trained ckpt path |
+| `--dataset-stats` | `runs/.../dataset_stats.json` | Normalizer stats path |
+| `--text-cache-dir` | `data/text_embeds_cache/real_1048` | Pre-computed text embed cache |
+| `--default-camera-info` | `configs/camera_info/real_1048_default.json` | Per-camera intrinsics for undistort |
+| `--ws-url` | `ws://192.168.31.66:19095` | rgbd_ws_bridge address |
+| `--ws-frame-max-age-ms` | `250` | Drop frames older than this in `latest()` |
+| `--ws-reconnect-backoff-ms` | `500,1000,2000,5000,10000` | Reconnect backoff schedule (caps at last value) |
+| `--ws-startup-timeout-ms` | `30000` | Abort if no first frame within this timeout |
+| `--ws-warn-stale-ms` | `200` | Watchdog WARN on per-channel age |
+| `--ws-hold-stale-ms` | `500` | Watchdog HOLD on per-channel age |
+| `--ws-estop-stale-ms` | `1500` | Watchdog EMERGENCY_STOP on per-channel age |
+| `--arm-host` | `192.168.31.34` | arm_sdk gRPC host |
+| `--arm-port` | `50051` | arm_sdk gRPC port |
+| `--arm-poll-hz` | `50` | ARM state poller frequency |
+| `--arm-state-max-age-ms` | `100` | Drop state older than this in `latest()` |
+| `--arm-lease-ms` | `15000` | acquire_control lease duration (SDK auto-renews @ 5s) |
+| `--arm-acquire-on` | `start` | `start` = acquire on `/start` (default); `init` = acquire at boot |
+| `--infer-period-ms` | `400` | Inference cadence (2.5 Hz) |
+| `--send-period-ms` | `50` | Dispatch cadence (20 Hz) |
+| `--blend-frames` | `4` | New/old chunk linear-blend overlap window |
+| `--chunk-len` | `None` (auto) | Action chunk length. `None` → `train_config.num_frames - 1` (=32) |
+| `--num-inference-steps` | `None` (auto) | Diffusion steps. `None` → `train_config.eval_num_inference_steps` (=10) |
+| `--chunk-max-stale-ms` | `2000` | Watchdog HOLD when newest chunk older than this |
+| `--auto-dispatch` | `False` | Send `arm.send_pose` only when set; otherwise dispatcher logs targets but does NOT command the arm |
+| `--emergency-on-failure` | `True` | Trip `set_arm_emergency_stop(True)` on hard fault |
+| `--watchdog-period-ms` | `10` | Watchdog tick period |
+| `--instruction` | `"open the door"` | Default task; `/start` may override via JSON body |
+| `--device` | `cuda:1` | GPU device. Default avoids `cuda:0` (reserved for AirDC capture) |
+| `--require-gpu-mem-free-gb` | `8.0` | Abort if free GPU memory falls below this at startup |
+| `--image-pipeline` | `raw_native` | `raw_native` = 1088×1280 → undistort → model. `lerobot_480x640` reproduces v1 stitch path |
+| `--undistort` / `--no-undistort` | `--undistort` | Toggle undistort step (rarely needed) |
+| `--warmup-infer-calls` | `5` | Warmup inferences during startup |
+| `--benchmark-infer-calls` | `10` | Benchmark inferences for p50/p95/p99 |
+| `--benchmark-p50-budget-ms` | `500` | Abort if benchmark p50 exceeds this |
+| `--skip-warmup` | `False` | Skip warmup+benchmark (useful for dev / smoke tests) |
+| `--log-level` | `INFO` | Standard `logging` level |
+
+## Example Session (cURL)
+
+```bash
+# 1. Health check (always safe; cheap)
+curl -s http://localhost:8118/health | jq .
+# {
+#   "status": "ok",
+#   "server": "fastwam_active_loop_server",
+#   "arm":  { "last_poll_age_ms": 19.5, "consecutive_fail": 0, "lease_alive": false, ... },
+#   "ws":   { "last_frame_age_per_channel_ms": {"head_left": 113.5, "right_wrist_left": 130.0},
+#             "fps_5s": 12.4, "decode_fail_count": 0, "reconnect_count": 0, "pair_seq_gaps": 0 }
+# }
+
+# 2. Zero-pose dry-test (arm MUST NOT move; verifies coordinate frame)
+curl -s -X POST http://localhost:8118/debug/zero_pose_test \
+  -H 'Content-Type: application/json' -d '{"duration_s": 5.0}' | jq .
+
+# 3. Start a real closed loop (default instruction)
+curl -s -X POST http://localhost:8118/start \
+  -H 'Content-Type: application/json' -d '{}' | jq .
+
+# 3b. Or override the instruction (must already exist in text-embed cache)
+curl -s -X POST http://localhost:8118/start \
+  -H 'Content-Type: application/json' -d '{"instruction": "open the door"}' | jq .
+
+# 4. Live status while running
+curl -s http://localhost:8118/closed_loop_status | jq .
+
+# 5. Graceful stop
+curl -s -X POST http://localhost:8118/stop -d '{}' | jq .
+
+# 6. Emergency stop (latching; clear with {"enable": false})
+curl -s -X POST http://localhost:8118/emergency \
+  -H 'Content-Type: application/json' -d '{"enable": true}' | jq .
+# ...later:
+curl -s -X POST http://localhost:8118/emergency \
+  -H 'Content-Type: application/json' -d '{"enable": false}' | jq .
+```
+
+## Real Startup Log (verified on `5090_1`)
+
+Trimmed sample from a real boot (model load + fingerprint + ARM poller +
+WS connect):
+
+```
+INFO [startup] script               = fastwam_active_loop_server.py v2
+INFO [startup] train_config_path    = runs/real_1048_uncond_2cam224_1e-4/2026-05-14_10-51-15/config.yaml
+INFO [startup] device               = cuda:1
+INFO [startup] ws_url               = ws://192.168.31.66:19095
+INFO [startup] ws_channels          = head_left, right_wrist_left  (identity mapping)
+INFO [startup] arm_host:port        = 192.168.31.34:50051
+INFO [startup] arm_lease_ms         = 15000     (SDK auto-renew @ 5s)
+INFO [startup] infer_period_ms      = 400       (2.5 Hz)
+INFO [startup] send_period_ms       = 50        (20.0 Hz)
+INFO [startup] blend_frames         = 4
+INFO [startup] image_pipeline       = raw_native (1088x1280 -> undistort -> model_clients)
+INFO [startup] scipy_version        = 1.15.3
+INFO [startup] gpu_free_mem_gb      = 30.83      (require >= 8.00)
+INFO loading FastWAMModelClient checkpoint=runs/.../step_020000.pt
+INFO Loading Wan2.2-TI2V-5B components...
+INFO Finished loading Wan2.2-TI2V-5B components in 17.22 seconds.
+INFO Initialized MoT with experts: ['video', 'action'], num_layers=30
+INFO   Expert 'video': num_params=5.00 B
+INFO   Expert 'action': num_params=1.02 B
+INFO [startup] rotation fingerprint test (5 GT samples from opendoor_real_1048): PASS
+INFO [startup] train.num_frames     = 33
+INFO [startup] chunk_len            = 32        (= num_frames - 1, frame-aligned backward delta)
+INFO [startup] action_output_dim    = 7         (xyz + rpy + gripper)
+INFO [startup] num_inference_steps  = 10        (from eval_num_inference_steps)
+INFO [arm] poller started host=192.168.31.34 port=50051 hz=50.0
+INFO Websocket connected
+# ... warmup + benchmark output (omitted when --skip-warmup) ...
+INFO FastWAM active-loop server ready at http://0.0.0.0:8118  (auto_dispatch=False)
+```
+
+Cold-start timing on `5090_1` (RTX 5090, GPU 1 idle):
+
+- model load (Wan2.2-TI2V-5B + ActionDiT) ≈ **17 s** (one-off)
+- rotation fingerprint test ≈ instant
+- WS first-frame wait ≤ 5 s (when upstream healthy)
+- warmup × 5 + benchmark × 10 ≈ 10 s
+- total cold-start ≈ **30–40 s** end-to-end
+
+## Troubleshooting
+
+### `ws error: [Errno 111] Connection refused` → server aborts after 30 s
+
+Upstream `rgbd_ws_bridge` is not running. Restart it on the bridge host and
+re-launch the server. Confirm with:
+
+```bash
+curl -sf -o /dev/null -w "%{http_code}\n" \
+  --connect-timeout 2 "http://192.168.31.66:19095" || echo "WS port closed"
+# Or one-shot probe:
+python scripts/fastwam_ws_probe.py --max-packets 5
+```
+
+The server's 30 s timeout is intentional: a silent stream would mean the
+runner produces actions from stale frames. Do not raise
+`--ws-startup-timeout-ms` as a workaround.
+
+### Server starts but `fps_5s` < 14 Hz in `/ws_status`
+
+Upstream `rgbd_ws_bridge` is degraded (observed several times during
+integration). Inference cadence (2.5 Hz) is unaffected as long as frame age
+< 250 ms, but the dispatcher's frame-age guard tightens. Either:
+
+1. restart the bridge upstream, or
+2. raise `--ws-frame-max-age-ms` temporarily (still bounded by the dispatcher's `chunk_max_stale_ms`).
+
+### `ConnectionRefusedError` to `192.168.31.34:50051`
+
+`arm_sdk` gRPC server is down on the controller box. Check the controller
+power / process, then re-launch.
+
+### `[Errno 111]` over a LAN IP even though host is reachable
+
+Process-wide proxy is intercepting LAN traffic. Set:
+
+```bash
+export NO_PROXY=192.168.31.66,192.168.31.34,127.0.0.1,localhost
+```
+
+The server already injects these into `os.environ` at boot, but matters for
+the cURL examples above when run from a different shell.
+
+### Startup aborts: `gpu_free_mem_gb=X.X < 8.0`
+
+GPU is occupied. On `5090_1`, GPU 0 is reserved for AirDC (typical free
+RAM < 25 GiB); GPU 1 is normally idle. Default `--device=cuda:1`; lower
+`--require-gpu-mem-free-gb` only after verifying the workload fits.
+
+### Startup aborts: `benchmark p50=XXX ms > 500 ms budget`
+
+Either the GPU is shared with another workload or the checkpoint loaded
+into the wrong dtype. Re-check `nvidia-smi`, then re-launch. As a last
+resort, drop `--num-inference-steps` (default 10) to 6 — design doc §3
+shows mean drops to ~117 ms with quality margin still untested in the
+wild.
+
+### `lease_alive: false` after `POST /start`
+
+`acquire_control` failed silently. The likely cause is another process
+holding the lease (concurrent server, leftover record-and-replay session).
+`set_arm_emergency_stop(false)` does NOT free the lease — kill the other
+client. Verify with the airbot controller logs.
+
+### text-embed cache miss on `/start {"instruction": "..."}`
+
+Only the cached instruction works at runtime. Pre-compute:
+
+```bash
+python scripts/precompute_text_embeds.py \
+  --instructions "open the door" "another phrase" \
+  --output-dir data/text_embeds_cache/real_1048
+```
+
+Then relaunch the server. Switching instruction live is unsupported by
+design (model loads a fixed text embed at boot).
+
+### Where to find the design rationale for any decision above
+
+`docs/fastwam_http_server_self_fetch_design.md` — every CLI default,
+endpoint, error path, and rollback level is cross-referenced from §3
+onward. This README is the operator manual; the design doc is the
+engineering reference.
